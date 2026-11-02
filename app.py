@@ -1,6 +1,7 @@
 """Vidupe Next desktop application. Python 3.11+, Pillow, numpy, opencv-python."""
 from __future__ import annotations
 import os, sys, threading, queue, subprocess, tkinter as tk
+from concurrent.futures import ThreadPoolExecutor
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 from PIL import Image, ImageTk
@@ -20,6 +21,8 @@ class App(tk.Tk):
         self.title('Vidupe Next  |  Video Duplicate Finder')
         self.geometry('1250x820');self.minsize(880,600);self.configure(bg=BG)
         self.folders=[];self.vids={};self.matches=[];self.groups=[];self.events=queue.Queue();self.stop=threading.Event();self.thumbnails=[]
+        self.preview_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='preview')
+        self.preview_cache={};self.preview_seq=0;self.active_path=None
         self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Group size');self.interval=tk.StringVar(value='6');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
         self.build();self.after(100,self.poll)
 
@@ -75,7 +78,7 @@ class App(tk.Tk):
         self.preview=[]
         for i in range(2):
             f=tk.Frame(detail,bg='#111b29',pady=8,padx=9);f.pack(fill='x',pady=6)
-            image=tk.Label(f,bg='#111b29',height=125,fg=MUTED,text='Select a match')
+            image=tk.Label(f,bg='#111b29',height=8,fg=MUTED,text='Select a match',font=('Segoe UI',10))
             image.pack(fill='x');name=tk.Label(f,bg='#111b29',fg=TEXT,font=('Segoe UI',10,'bold'),wraplength=350,justify='left');name.pack(anchor='w',pady=(5,2))
             info=tk.Label(f,bg='#111b29',fg=MUTED,font=('Segoe UI',9),wraplength=350,justify='left');info.pack(anchor='w')
             self.preview.append((image,name,info))
@@ -121,6 +124,9 @@ class App(tk.Tk):
                     self.progress['value']=100*n/max(1,total)
                 elif msg[0]=='done':self.render(*msg[1:]);self.startbtn.configure(text='SCAN VIDEOS',bg=GREEN)
                 elif msg[0]=='error':messagebox.showerror('Scan failed',msg[1]);self.startbtn.configure(text='SCAN VIDEOS',bg=GREEN)
+                elif msg[0]=='preview':
+                    _,path,slot,token,frame=msg
+                    self._apply_preview(path,slot,token,frame)
         except queue.Empty:pass
         self.after(100,self.poll)
 
@@ -144,6 +150,7 @@ class App(tk.Tk):
     def filter_results(self):
         if not hasattr(self,'tree'):return
         self.tree.delete(*self.tree.get_children())
+        self.preview_seq+=1
         self.item_path={}; self.group_members={}
         try: floor=float(self.min_score.get())
         except (ValueError,tk.TclError): floor=0
@@ -201,17 +208,95 @@ class App(tk.Tk):
         self.filter_results()
         messagebox.showinfo('Recycle completed',f'{len(moved)} files moved to Recycle Bin. '+(f'{len(errors)} failed: '+errors[0][:150] if errors else ''))
 
+    @staticmethod
+    def _preview_frame(path: str):
+        """Return JPEG bytes or None. Never block Tk's main/UI thread."""
+        import io
+        try:
+            # Probe duration to seek away from intro/black opening frames.
+            from engine import probe, SUBPROCESS_FLAGS
+            duration, _, _ = probe(path)
+            timestamp = max(0.0, min(duration * 0.22, max(0.0, duration - 0.4)))
+            cmd = ['ffmpeg','-hide_banner','-loglevel','error','-nostdin',
+                   '-ss',f'{timestamp:.2f}','-i',path,'-frames:v','1',
+                   '-vf','scale=520:270:force_original_aspect_ratio=decrease',
+                   '-f','image2pipe','-vcodec','mjpeg','pipe:1']
+            proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                                timeout=15,creationflags=SUBPROCESS_FLAGS)
+            if proc.returncode != 0 or not proc.stdout:return None
+            im=Image.open(io.BytesIO(proc.stdout)).convert('RGB')
+            im.thumbnail((490,175),Image.Resampling.LANCZOS)
+            return im
+        except Exception:
+            return None
+
+    def _load_preview(self, path, slot, token):
+        if path in self.preview_cache:
+            self._apply_preview(path,slot,token,self.preview_cache[path]);return
+        def job():
+            result=self._preview_frame(path)
+            self.events.put(('preview',path,slot,token,result))
+        self.preview_pool.submit(job)
+
+    def _apply_preview(self,path,slot,token,frame):
+        if token != self.preview_seq:return
+        if frame is not None:self.preview_cache[path]=frame
+        label=self.preview[slot][0]
+        if frame is None:
+            label.configure(image='',text='Preview unavailable. Open video in Explorer.')
+            label.image=None
+        else:
+            photo=ImageTk.PhotoImage(frame,master=self)
+            label.configure(image=photo,text='')
+            label.image=photo  # keep Tk image alive
+
+    def _display_pair(self, paths, match=None):
+        self.preview_seq+=1
+        token=self.preview_seq
+        for slot in range(2):
+            image,name,info=self.preview[slot]
+            path=paths[slot] if slot < len(paths) else None
+            if not path or path not in self.vids:
+                image.configure(image='',text='Select a file to compare')
+                image.image=None;name.configure(text='');info.configure(text='')
+                continue
+            v=self.vids[path]
+            image.configure(image='',text='Loading thumbnail...')
+            image.image=None
+            name.configure(text=os.path.basename(path))
+            info.configure(text=f'{v.width} × {v.height} | {v.duration:.1f}s | {v.size/1024**2:.1f} MB\n{path}')
+            self._load_preview(path,slot,token)
+        if match:
+            self.score.configure(text=f'Match: {match.confidence:.1f}%  |  {match.aligned_frames} aligned frames  |  overlap {match.covered:.0%}')
+        else:
+            self.score.configure(text='Select a video or group to review possible duplicates.')
+
     def selected(self,_event=None):
-        selection=[i for i in self.tree.selection() if i in self.item_path]
+        selection=list(self.tree.selection())
         if not selection:return
-        path=self.item_path[selection[-1]];v=self.vids.get(path)
-        if not v:return
-        self.active_path=path
-        image,name,info=self.preview[0]
-        image.configure(image='',text='Video preview available in Explorer')
-        name.configure(text=os.path.basename(path))
-        info.configure(text=f'{v.width} x {v.height} | {v.duration:.1f}s | {v.size/1024**2:.1f} MB\n{path}')
-        self.score.configure(text=f'{len(selection)} files selected. Sorting uses resolution and file size, not guaranteed image quality.')
+        file_rows=[i for i in selection if i in self.item_path]
+        if file_rows:
+            path=self.item_path[file_rows[-1]]
+            self.active_path=path
+            selected_paths=[self.item_path[i] for i in file_rows]
+            match=next((m for m in sorted(self.matches,key=lambda m:m.confidence,reverse=True)
+                        if (m.left == path and m.right in self.vids) or
+                           (m.right == path and m.left in self.vids)),None)
+            if len(selected_paths)>=2:
+                other=next((p for p in reversed(selected_paths[:-1]) if p!=path),None)
+                pair=[path,other] if other else [path]
+            elif match:
+                pair=[path,match.right if match.left==path else match.left]
+            else:pair=[path]
+            self._display_pair(pair,match)
+        else:
+            group_id=next((i for i in selection if i in self.group_members),None)
+            if group_id:
+                group=self.group_members[group_id]
+                pair=group[:2]
+                self.active_path=pair[0] if pair else None
+                match=next((m for m in self.matches if m.left in pair and m.right in pair),None)
+                self._display_pair(pair,match)
 
     def open_selected(self):
         if not hasattr(self,'active_path'):return
