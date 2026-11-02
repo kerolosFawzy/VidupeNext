@@ -12,6 +12,10 @@ import cv2
 
 EXTENSIONS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.webm','.mpeg','.mpg','.flv','.3gp','.ts','.mts'}
 CACHE_VERSION = 4
+# Windows GUI applications must not open an FFmpeg console for every frame.
+SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+# Prevent OpenCV from taking additional CPU worker threads per scan task.
+cv2.setNumThreads(1)
 
 @dataclass
 class Video:
@@ -35,7 +39,7 @@ class Match:
 
 def probe(path: str) -> tuple[float,int,int]:
     p = subprocess.run(['ffprobe','-v','error','-select_streams','v:0','-show_entries',
-        'stream=width,height:format=duration','-of','json',path],capture_output=True,text=True,timeout=30)
+        'stream=width,height:format=duration','-of','json',path],capture_output=True,text=True,timeout=30,creationflags=SUBPROCESS_FLAGS)
     if p.returncode: raise RuntimeError(p.stderr.strip()[:180] or 'ffprobe failed')
     obj=json.loads(p.stdout); stream=(obj.get('streams') or [{}])[0]
     return (float(obj.get('format',{}).get('duration') or 0),int(stream.get('width') or 0),int(stream.get('height') or 0))
@@ -47,7 +51,7 @@ def frame_at(path: str, t: float) -> np.ndarray | None:
          '-i',path,'-an','-sn','-frames:v','1','-vf','scale=128:128:force_original_aspect_ratio=decrease,pad=128:128:(ow-iw)/2:(oh-ih)/2',
          '-f','image2pipe','-vcodec','mjpeg','pipe:1']
     try:
-        p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=24)
+        p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=24,creationflags=SUBPROCESS_FLAGS)
         if p.returncode or not p.stdout: return None
         return cv2.imdecode(np.frombuffer(p.stdout,dtype=np.uint8),cv2.IMREAD_GRAYSCALE)
     except (OSError,subprocess.TimeoutExpired): return None
@@ -75,11 +79,12 @@ def sample_times(duration:float, interval:float=8.0, max_frames:int=75) -> list[
     return [round(float(x),3) for x in np.linspace(margin,max(margin,duration-margin),count)]
 
 
-def analyze(path:str, interval:float=8.0, max_frames:int=75)->Video:
+def analyze(path:str, interval:float=8.0, max_frames:int=75, stop:threading.Event|None=None)->Video:
     duration,w,h=probe(path)
     if duration<=0 or not w or not h: raise ValueError('No valid video track/duration')
     frames=[]
     for t in sample_times(duration,interval,max_frames):
+        if stop is not None and stop.is_set(): raise InterruptedError('Scan cancelled')
         hashed=phash(frame_at(path,t))
         if hashed is not None: frames.append((t,hashed))
     if len(frames)<2: raise ValueError('Too few usable video frames')
@@ -212,15 +217,17 @@ def scan(folders:list[str],cache_path:str,interval:float=8.0,threshold:int=13,mi
         key=fingerprint_key(path)+f"|{interval:.3f}|75"
         saved=cache.get(key)
         if saved:return key,Video(**saved)
-        return key,analyze(path,interval)
-    with ThreadPoolExecutor(max_workers=min(4,os.cpu_count() or 2)) as executor:
+        return key,analyze(path,interval,stop=stop)
+    with ThreadPoolExecutor(max_workers=1) as executor:  # one FFmpeg process at a time
         futures={executor.submit(job,p):p for p in files}
         for i,future in enumerate(as_completed(futures),1):
             try:
                 key,vid=future.result();vids.append(vid);cache[key]=asdict(vid)
             except Exception as e:errors.append((futures[future],str(e)))
             if progress:progress('fingerprints',i,len(files))
-            if stop is not None and stop.is_set():break
+            if stop is not None and stop.is_set():
+                for pending in futures: pending.cancel()
+                break
     save_cache(cache_path,cache)
     if stop is not None and stop.is_set():return vids,[],errors
     matches=find_matches(vids,threshold,minimum_coverage,

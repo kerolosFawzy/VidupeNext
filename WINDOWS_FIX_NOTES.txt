@@ -1,0 +1,1 @@
+Windows console/CPU fix: FFmpeg and FFprobe subprocesses run with CREATE_NO_WINDOW; only one FFmpeg job runs at a time; OpenCV threading capped; Stop checks between frames. Rebuild the EXE using build_windows.ps1, then replace your old application folder. The already-built EXE is not changed by downloading this source patch.
