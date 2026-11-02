@@ -1,0 +1,37 @@
+name: Build Windows EXE and Installer
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+      - name: Install FFmpeg and Inno Setup
+        shell: pwsh
+        run: |
+          choco install ffmpeg innosetup --yes --no-progress
+          $ffdir = Get-ChildItem 'C:\ProgramData\chocolatey\lib\ffmpeg' -Filter ffmpeg.exe -File -Recurse | Select-Object -First 1 -ExpandProperty DirectoryName
+          if (-not $ffdir) { throw 'FFmpeg binary not found' }
+          $env:GITHUB_PATH | Out-Null
+          Add-Content -Path $env:GITHUB_PATH -Value $ffdir
+      - name: Package Windows application
+        shell: pwsh
+        run: .\build_windows.ps1
+      - name: Upload standalone Windows application
+        uses: actions/upload-artifact@v4
+        with:
+          name: VidupeNext-Windows-Portable
+          path: dist/VidupeNext/
+          if-no-files-found: error
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: VidupeNext-Windows-Installer
+          path: installer-output/*.exe
+          if-no-files-found: error
