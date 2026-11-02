@@ -19,10 +19,10 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Vidupe Next  |  Video Duplicate Finder')
-        self.geometry('1250x820');self.minsize(880,600);self.configure(bg=BG)
+        self.geometry('1600x980');self.minsize(1100,740);self.configure(bg=BG)
         self.folders=[];self.vids={};self.matches=[];self.groups=[];self.events=queue.Queue();self.stop=threading.Event();self.thumbnails=[]
         self.preview_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='preview')
-        self.preview_cache={};self.preview_seq=0;self.active_path=None
+        self.preview_cache={};self.preview_seq=0;self.active_path=None;self.preview_paths=[None,None];self._preview_resize_job=None
         self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Group size');self.interval=tk.StringVar(value='6');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
         self.build();self.after(100,self.poll)
 
@@ -59,7 +59,7 @@ class App(tk.Tk):
             f=tk.Frame(cards,bg=PANEL,padx=17,pady=10,highlightbackground=LINE,highlightthickness=1);f.pack(side='left',fill='x',expand=True,padx=3)
             self.label(f,title,10,MUTED).pack(anchor='w');val=self.label(f,'0',20,TEXT,True);val.pack(anchor='w',pady=(3,0));self.count_labels.append(val)
         body=tk.PanedWindow(self,orient=tk.HORIZONTAL,bg=BG,sashwidth=5,bd=0);body.pack(fill='both',expand=True,padx=22,pady=14)
-        results=tk.Frame(body,bg=PANEL);body.add(results,minsize=400,stretch='always')
+        results=tk.Frame(body,bg=PANEL);body.add(results,minsize=420,stretch='always')
         self.label(results,'DUPLICATE GROUPS  •  Select files to remove',12,TEXT,True).pack(anchor='w',padx=14,pady=8)
         actions=tk.Frame(results,bg=PANEL);actions.pack(fill='x',padx=8,pady=5)
         ttk.Combobox(actions,textvariable=self.sort_by,values=['Group size','Potential savings','Best similarity','Group name'],state='readonly',width=17).pack(side='left',padx=4)
@@ -73,15 +73,16 @@ class App(tk.Tk):
             self.tree.heading(k,text=t);self.tree.column(k,width=w,minwidth=60,anchor='center')
         sb=ttk.Scrollbar(results,orient='vertical',command=self.tree.yview);self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side='right',fill='y');self.tree.pack(fill='both',expand=True,padx=(10,0),pady=(0,12));self.tree.bind('<<TreeviewSelect>>',self.selected)
-        detail=tk.Frame(body,bg=PANEL,padx=15,pady=12);body.add(detail,minsize=300,stretch='always')
-        self.label(detail,'REVIEW MATCH',12,TEXT,True).pack(anchor='w',pady=(0,12))
+        detail=tk.Frame(body,bg=PANEL,padx=12,pady=10);body.add(detail,minsize=520,stretch='always')
+        self.label(detail,'REVIEW MATCH  •  Double-click a preview to enlarge',12,TEXT,True).pack(anchor='w',pady=(0,6))
         self.preview=[]
         for i in range(2):
             f=tk.Frame(detail,bg='#111b29',pady=8,padx=9);f.pack(fill='x',pady=6)
-            image=tk.Label(f,bg='#111b29',height=8,fg=MUTED,text='Select a match',font=('Segoe UI',10))
-            image.pack(fill='x');name=tk.Label(f,bg='#111b29',fg=TEXT,font=('Segoe UI',10,'bold'),wraplength=350,justify='left');name.pack(anchor='w',pady=(5,2))
+            image=tk.Label(f,bg='#111b29',height=13,fg=MUTED,text='Select a match',font=('Segoe UI',10),cursor='hand2')
+            image.pack(fill='both',expand=True);image.bind('<Double-Button-1>',lambda event,slot=i:self.open_large_preview(slot));name=tk.Label(f,bg='#111b29',fg=TEXT,font=('Segoe UI',10,'bold'),wraplength=350,justify='left');name.pack(anchor='w',pady=(5,2))
             info=tk.Label(f,bg='#111b29',fg=MUTED,font=('Segoe UI',9),wraplength=350,justify='left');info.pack(anchor='w')
             self.preview.append((image,name,info))
+        detail.bind('<Configure>',self._schedule_preview_resize)
         self.score=self.label(detail,'Select a matching pair to view details.',10,GREEN);self.score.pack(anchor='w',pady=(12,8))
         tk.Button(detail,text='Open selected file in Explorer',command=self.open_selected,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(fill='x',pady=4)
         tk.Button(detail,text='Export matches as CSV',command=self.export,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(fill='x',pady=4)
@@ -219,13 +220,12 @@ class App(tk.Tk):
             timestamp = max(0.0, min(duration * 0.22, max(0.0, duration - 0.4)))
             cmd = ['ffmpeg','-hide_banner','-loglevel','error','-nostdin',
                    '-ss',f'{timestamp:.2f}','-i',path,'-frames:v','1',
-                   '-vf','scale=520:270:force_original_aspect_ratio=decrease',
+                   '-vf','scale=1280:720:force_original_aspect_ratio=decrease',
                    '-f','image2pipe','-vcodec','mjpeg','pipe:1']
             proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
                                 timeout=15,creationflags=SUBPROCESS_FLAGS)
             if proc.returncode != 0 or not proc.stdout:return None
             im=Image.open(io.BytesIO(proc.stdout)).convert('RGB')
-            im.thumbnail((490,175),Image.Resampling.LANCZOS)
             return im
         except Exception:
             return None
@@ -246,9 +246,58 @@ class App(tk.Tk):
             label.configure(image='',text='Preview unavailable. Open video in Explorer.')
             label.image=None
         else:
-            photo=ImageTk.PhotoImage(frame,master=self)
-            label.configure(image=photo,text='')
-            label.image=photo  # keep Tk image alive
+            self._render_preview(slot,frame)
+
+    def _render_preview(self, slot, frame):
+        label=self.preview[slot][0]
+        width=max(350,label.winfo_width()-12)
+        height=max(170,label.winfo_height()-12)
+        # Never upscale pixels beyond the decoded frame size.
+        scaled=frame.copy()
+        scaled.thumbnail((width,height),Image.Resampling.LANCZOS)
+        photo=ImageTk.PhotoImage(scaled,master=self)
+        label.configure(image=photo,text='')
+        label.image=photo
+
+    def _schedule_preview_resize(self, _event=None):
+        if self._preview_resize_job is not None:
+            self.after_cancel(self._preview_resize_job)
+        self._preview_resize_job=self.after(160,self._refresh_preview_sizes)
+
+    def _refresh_preview_sizes(self):
+        self._preview_resize_job=None
+        for slot,path in enumerate(self.preview_paths):
+            if path and path in self.preview_cache and self.preview_cache[path] is not None:
+                self._render_preview(slot,self.preview_cache[path])
+
+    def open_large_preview(self,slot):
+        path=self.preview_paths[slot]
+        if not path or path not in self.preview_cache or self.preview_cache[path] is None:
+            return
+        frame=self.preview_cache[path]
+        popup=tk.Toplevel(self)
+        popup.title('Video preview  |  '+os.path.basename(path))
+        popup.geometry('1200x800')
+        popup.minsize(500,350)
+        popup.configure(bg=BG)
+        tk.Label(popup,text=path,bg=BG,fg=TEXT,font=('Segoe UI',11),wraplength=1140).pack(fill='x',padx=14,pady=10)
+        canvas=tk.Label(popup,bg=BG)
+        canvas.pack(fill='both',expand=True,padx=12,pady=12)
+        pending=[None]
+        def render():
+            pending[0]=None
+            size=(max(100,canvas.winfo_width()-12),max(100,canvas.winfo_height()-12))
+            scaled=frame.copy()
+            scaled.thumbnail(size,Image.Resampling.LANCZOS)
+            photo=ImageTk.PhotoImage(scaled,master=popup)
+            canvas.configure(image=photo)
+            canvas.image=photo
+        def resize(_event=None):
+            if pending[0] is not None:popup.after_cancel(pending[0])
+            pending[0]=popup.after(100,render)
+        canvas.bind('<Configure>',resize)
+        popup.bind('<Escape>',lambda _event:popup.destroy())
+        popup.after(120,render)
 
     def _display_pair(self, paths, match=None):
         self.preview_seq+=1
@@ -256,6 +305,7 @@ class App(tk.Tk):
         for slot in range(2):
             image,name,info=self.preview[slot]
             path=paths[slot] if slot < len(paths) else None
+            self.preview_paths[slot]=path
             if not path or path not in self.vids:
                 image.configure(image='',text='Select a file to compare')
                 image.image=None;name.configure(text='');info.configure(text='')
