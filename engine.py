@@ -2,7 +2,7 @@
 Independent GPLv3-compatible implementation. ffmpeg and ffprobe must be in PATH.
 """
 from __future__ import annotations
-import json, os, math, subprocess, hashlib, pathlib, threading
+import json, os, math, subprocess, hashlib, pathlib, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from collections import defaultdict, Counter
@@ -238,32 +238,55 @@ def groups(matches:list[Match]):
 
 
 def scan(folders:list[str],cache_path:str,interval:float=8.0,threshold:int=13,minimum_coverage:float=.28,
-         progress:Callable|None=None,stop:threading.Event|None=None):
+         progress:Callable|None=None,stop:threading.Event|None=None,workers:int=4):
     files=list(iter_files(folders));cache=read_cache(cache_path);vids=[];errors=[]
     if progress:progress('discovered',0,len(files))
-    for i,path in enumerate(files,1):
+    pending=[]
+    for path in files:
         if stop is not None and stop.is_set():break
-        if progress:progress('video %d/%d: %s' % (i,len(files),os.path.basename(path)),0,3)
         try:
             key=fingerprint_key(path)+f'|{interval:.3f}|batch-v1'
-            saved=cache.get(key)
-            if saved:
-                vid=Video(**saved)
+            if key in cache:
+                vids.append(Video(**cache[key]))
             else:
-                def frame_progress(n,total):
-                    if progress:progress('video %d/%d: %s | frames' % (i,len(files),os.path.basename(path)),n,total)
-                vid=analyze(path,interval,MAX_SAMPLE_FRAMES,stop,frame_progress)
-                cache[key]=asdict(vid)
-                save_cache(cache_path,cache)
-            vids.append(vid)
-        except InterruptedError:
-            break
-        except Exception as e:
-            errors.append((path,str(e)))
-        if progress:progress('fingerprints',i,len(files))
+                pending.append((path,key))
+        except Exception as exc: errors.append((path,str(exc)))
+    completed=len(vids)+len(errors)
+    if progress:progress('fingerprints',completed,len(files))
+    # The decoding subprocesses are independent. Bound concurrency to prevent CPU/disk starvation.
+    workers=max(1,min(16,int(workers)))
+    def job(item):
+        path,key=item
+        if stop is not None and stop.is_set():raise InterruptedError('Scan cancelled')
+        return key,analyze(path,interval,MAX_SAMPLE_FRAMES,stop)
+    # map() yields in submission order, ensuring cache is written only on the GUI worker thread.
+    # Limited pending futures to avoid enqueuing thousands of large video operations.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        iterator=iter(pending)
+        futures={}
+        for _ in range(min(workers*2,len(pending))):
+            item=next(iterator,None)
+            if item:futures[pool.submit(job,item)]=item
+        while futures:
+            for future in as_completed(tuple(futures)):
+                path,key=futures.pop(future)
+                try:
+                    k,vid=future.result()
+                    vids.append(vid)
+                    cache[k]=asdict(vid)
+                    # Persist every 20 files rather than rewriting entire JSON for each file.
+                    if len(vids)%20==0:save_cache(cache_path,cache)
+                except InterruptedError: pass
+                except Exception as exc:errors.append((path,str(exc)))
+                completed+=1
+                if progress:progress('fingerprints',completed,len(files))
+                if stop is None or not stop.is_set():
+                    item=next(iterator,None)
+                    if item:futures[pool.submit(job,item)]=item
+                break
+    save_cache(cache_path,cache)
     if stop is not None and stop.is_set():return vids,[],errors
     if progress:progress('comparing',0,1)
-    # Allow partial candidates when sampling windows do not align after trimming.
     matches=find_matches(vids,threshold,minimum_coverage,
        callback=(lambda n,total:progress('comparison',n,total)) if progress else None)
     return vids,matches,errors
