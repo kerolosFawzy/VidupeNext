@@ -11,7 +11,8 @@ import numpy as np
 import cv2
 
 EXTENSIONS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.webm','.mpeg','.mpg','.flv','.3gp','.ts','.mts'}
-CACHE_VERSION = 4
+CACHE_VERSION = 6
+MAX_SAMPLE_FRAMES = 16  # Fast initial pass; lower accuracy for short overlaps.
 # Windows GUI applications must not open an FFmpeg console for every frame.
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 # Prevent OpenCV from taking additional CPU worker threads per scan task.
@@ -39,7 +40,7 @@ class Match:
 
 def probe(path: str) -> tuple[float,int,int]:
     p = subprocess.run(['ffprobe','-v','error','-select_streams','v:0','-show_entries',
-        'stream=width,height:format=duration','-of','json',path],capture_output=True,text=True,timeout=30,creationflags=SUBPROCESS_FLAGS)
+        'stream=width,height:format=duration','-of','json',path],capture_output=True,text=True,timeout=12,creationflags=SUBPROCESS_FLAGS)
     if p.returncode: raise RuntimeError(p.stderr.strip()[:180] or 'ffprobe failed')
     obj=json.loads(p.stdout); stream=(obj.get('streams') or [{}])[0]
     return (float(obj.get('format',{}).get('duration') or 0),int(stream.get('width') or 0),int(stream.get('height') or 0))
@@ -51,7 +52,7 @@ def frame_at(path: str, t: float) -> np.ndarray | None:
          '-i',path,'-an','-sn','-frames:v','1','-vf','scale=128:128:force_original_aspect_ratio=decrease,pad=128:128:(ow-iw)/2:(oh-ih)/2',
          '-f','image2pipe','-vcodec','mjpeg','pipe:1']
     try:
-        p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=24,creationflags=SUBPROCESS_FLAGS)
+        p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=8,creationflags=SUBPROCESS_FLAGS)
         if p.returncode or not p.stdout: return None
         return cv2.imdecode(np.frombuffer(p.stdout,dtype=np.uint8),cv2.IMREAD_GRAYSCALE)
     except (OSError,subprocess.TimeoutExpired): return None
@@ -70,7 +71,7 @@ def phash(gray: np.ndarray) -> int | None:
 def hamming(a: int,b: int) -> int: return (a^b).bit_count()
 
 
-def sample_times(duration:float, interval:float=8.0, max_frames:int=75) -> list[float]:
+def sample_times(duration:float, interval:float=8.0, max_frames:int=MAX_SAMPLE_FRAMES) -> list[float]:
     if duration < .3: return []
     # Use actual time spacing so clips shifted or trimmed by seconds still align.
     count=min(max_frames,max(5, math.ceil(duration/interval)))
@@ -79,15 +80,42 @@ def sample_times(duration:float, interval:float=8.0, max_frames:int=75) -> list[
     return [round(float(x),3) for x in np.linspace(margin,max(margin,duration-margin),count)]
 
 
-def analyze(path:str, interval:float=8.0, max_frames:int=75, stop:threading.Event|None=None)->Video:
+def _batch_frames(path: str, start: float, count: int, step: float = 3.0):
+    """One FFmpeg process per scene region, not one process per frame.
+    Decode keyframes only, reducing CPU cost on long videos. Keep short region
+    sampling to avoid scanning entire movies during the first pass.
+    """
+    side=64
+    vf=f"fps=1/{step},scale={side}:{side}:force_original_aspect_ratio=decrease,pad={side}:{side}:(ow-iw)/2:(oh-ih)/2,format=gray"
+    cmd=['ffmpeg','-hide_banner','-loglevel','error','-nostdin','-ss',str(round(start,2)),
+         '-skip_frame','nokey','-i',path,'-an','-sn','-vf',vf,
+         '-frames:v',str(count),'-f','rawvideo','-pix_fmt','gray','pipe:1']
+    try:
+        p=subprocess.run(cmd, stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                         timeout=16,creationflags=SUBPROCESS_FLAGS)
+        n=min(count,len(p.stdout)//(side*side))
+        return [np.frombuffer(p.stdout[i*side*side:(i+1)*side*side],dtype=np.uint8).reshape(side,side)
+                for i in range(n)]
+    except (OSError,subprocess.TimeoutExpired):return []
+
+
+def analyze(path:str, interval:float=8.0, max_frames:int=MAX_SAMPLE_FRAMES, stop:threading.Event|None=None, frame_progress:Callable|None=None)->Video:
     duration,w,h=probe(path)
     if duration<=0 or not w or not h: raise ValueError('No valid video track/duration')
     frames=[]
-    for t in sample_times(duration,interval,max_frames):
+    # 3 inexpensive scene regions across the video; 3 FFmpeg launches rather
+    # than 16-75. No dependence on identical total durations.
+    per_region=4
+    step=max(1.5,min(4.0,interval/2))
+    starts=[min(max(0,duration-12),duration*x) for x in (.05,.43,.80)]
+    for region,start in enumerate(starts):
         if stop is not None and stop.is_set(): raise InterruptedError('Scan cancelled')
-        hashed=phash(frame_at(path,t))
-        if hashed is not None: frames.append((t,hashed))
-    if len(frames)<2: raise ValueError('Too few usable video frames')
+        batch=_batch_frames(path,start,per_region,step)
+        for k,gray in enumerate(batch):
+            hsh=phash(gray)
+            if hsh is not None:frames.append((round(start+k*step,2),hsh))
+        if frame_progress:frame_progress(region+1,len(starts))
+    if not frames:raise ValueError('No readable frames (check ffmpeg codecs)')
     return Video(path,duration,w,h,os.path.getsize(path),frames)
 
 
@@ -141,7 +169,7 @@ def compare(a:Video,b:Video, threshold:int=13, minimum_coverage:float=.28)->Matc
     """Find shifted/trimmed timeline overlaps, reject isolated matching stills.
     Offset bins accommodate sparse frame sampling; secondary verification near predicted t.
     """
-    if len(a.frames)<2 or len(b.frames)<2: return None
+    if not a.frames or not b.frames: return None
     near=[]
     for ta,ha in a.frames:
         for tb,hb in b.frames:
@@ -166,7 +194,7 @@ def compare(a:Video,b:Video, threshold:int=13, minimum_coverage:float=.28)->Matc
         for ta,tb,d in sorted(hits,key=lambda z:(abs((z[1]-z[0])-delta),z[2])):
             if ta in used_a or tb in used_b or abs((tb-ta)-delta)>9:continue
             used_a.add(ta);used_b.add(tb);pairs.append((ta,tb,d))
-        if len(pairs)<3:continue
+        if len(pairs)<2:continue
         coverage=min(len(pairs)/max(1,len(a.frames)),len(pairs)/max(1,len(b.frames)))
         # For clips with mismatched length, use shorter-video coverage as overlap evidence.
         shorter=min(len(a.frames),len(b.frames))
@@ -175,8 +203,8 @@ def compare(a:Video,b:Video, threshold:int=13, minimum_coverage:float=.28)->Matc
         # Distinct scenes spread over time rather than a few adjacent similar frames.
         span_a=max(p[0] for p in pairs)-min(p[0] for p in pairs)
         span_b=max(p[1] for p in pairs)-min(p[1] for p in pairs)
-        if len(pairs)<4 and min(a.duration,b.duration)>40:continue
-        if min(span_a,span_b)<min(12,min(a.duration,b.duration)*.20):continue
+        if len(pairs)<3 and min(a.duration,b.duration)>40:continue
+        if min(span_a,span_b)<min(5,min(a.duration,b.duration)*.10):continue
         avg=sum(d for _,_,d in pairs)/len(pairs)
         confidence=min(99.0,100*(.47*short_cover+.33*(1-avg/64)+.20*min(1,len(pairs)/9)))
         quality=(len(pairs),short_cover,-avg)
@@ -212,24 +240,30 @@ def groups(matches:list[Match]):
 def scan(folders:list[str],cache_path:str,interval:float=8.0,threshold:int=13,minimum_coverage:float=.28,
          progress:Callable|None=None,stop:threading.Event|None=None):
     files=list(iter_files(folders));cache=read_cache(cache_path);vids=[];errors=[]
-    if progress:progress('discovered',len(files),len(files))
-    def job(path):
-        key=fingerprint_key(path)+f"|{interval:.3f}|75"
-        saved=cache.get(key)
-        if saved:return key,Video(**saved)
-        return key,analyze(path,interval,stop=stop)
-    with ThreadPoolExecutor(max_workers=1) as executor:  # one FFmpeg process at a time
-        futures={executor.submit(job,p):p for p in files}
-        for i,future in enumerate(as_completed(futures),1):
-            try:
-                key,vid=future.result();vids.append(vid);cache[key]=asdict(vid)
-            except Exception as e:errors.append((futures[future],str(e)))
-            if progress:progress('fingerprints',i,len(files))
-            if stop is not None and stop.is_set():
-                for pending in futures: pending.cancel()
-                break
-    save_cache(cache_path,cache)
+    if progress:progress('discovered',0,len(files))
+    for i,path in enumerate(files,1):
+        if stop is not None and stop.is_set():break
+        if progress:progress('video %d/%d: %s' % (i,len(files),os.path.basename(path)),0,3)
+        try:
+            key=fingerprint_key(path)+f'|{interval:.3f}|batch-v1'
+            saved=cache.get(key)
+            if saved:
+                vid=Video(**saved)
+            else:
+                def frame_progress(n,total):
+                    if progress:progress('video %d/%d: %s | frames' % (i,len(files),os.path.basename(path)),n,total)
+                vid=analyze(path,interval,MAX_SAMPLE_FRAMES,stop,frame_progress)
+                cache[key]=asdict(vid)
+                save_cache(cache_path,cache)
+            vids.append(vid)
+        except InterruptedError:
+            break
+        except Exception as e:
+            errors.append((path,str(e)))
+        if progress:progress('fingerprints',i,len(files))
     if stop is not None and stop.is_set():return vids,[],errors
+    if progress:progress('comparing',0,1)
+    # Allow partial candidates when sampling windows do not align after trimming.
     matches=find_matches(vids,threshold,minimum_coverage,
        callback=(lambda n,total:progress('comparison',n,total)) if progress else None)
     return vids,matches,errors

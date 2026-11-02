@@ -89,6 +89,8 @@ class App(tk.Tk):
         if self.startbtn.cget('text')=='STOP SCAN':self.stop.set();self.status.set('Stopping after current operations...');return
         self.stop.clear();self.startbtn.configure(text='STOP SCAN',bg='#f5aa5b')
         self.tree.delete(*self.tree.get_children());self.vids={};self.matches=[];self.groups=[]
+        for lbl in self.count_labels:lbl.configure(text='0')
+        self.status.set('Discovering videos...')
         mapping={'Strict':(9,.45),'Balanced':(13,.28),'Sensitive':(17,.22)}; threshold,cover=mapping[self.sensitivity.get()]
         def worker():
             try:
@@ -103,7 +105,8 @@ class App(tk.Tk):
             while True:
                 msg=self.events.get_nowait()
                 if msg[0]=='progress':
-                    _,stage,n,total=msg;self.status.set(f'{stage.title()}: {n} / {total}')
+                    _,stage,n,total=msg;self.status.set(f'{stage}: {n} / {total}')
+                    if stage == 'fingerprints': self.count_labels[0].configure(text=str(n))
                     self.progress['value']=100*n/max(1,total)
                 elif msg[0]=='done':self.render(*msg[1:]);self.startbtn.configure(text='SCAN VIDEOS',bg=GREEN)
                 elif msg[0]=='error':messagebox.showerror('Scan failed',msg[1]);self.startbtn.configure(text='SCAN VIDEOS',bg=GREEN)

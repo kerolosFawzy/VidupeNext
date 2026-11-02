@@ -1,0 +1,14 @@
+FAST SCAN FIX
+
+Original issue: up to 75 independent FFmpeg launches per video; no per-frame progress shown.
+
+Changes: up to 16 frame samples per video, per-frame progress, completed-video counter while scanning, incremental persistent cache, 8-second frame timeout and 12-second FFprobe timeout. One process at a time and hidden Windows console windows remain in place.
+
+Trade-off: 16-frame sampling is a FAST initial pass, and can miss short clips or overlapping excerpts. For accuracy-critical scans, a future two-stage search is recommended.
+
+Rebuild on Windows from inside this VidupeNext directory:
+  powershell -ExecutionPolicy Bypass -File .\build_windows.ps1
+
+Replace the old installed EXE with the newly built application or rerun the resulting setup installer. Scan a folder with 2-5 short videos first.
+
+The app has not been runtime-tested on Windows in this environment.
