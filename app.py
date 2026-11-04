@@ -9,7 +9,7 @@ from PIL import Image, ImageTk
 if getattr(sys, 'frozen', False):
     bundled_dir = Path(getattr(sys, '_MEIPASS', Path(sys.executable).parent))
     os.environ['PATH'] = str(bundled_dir) + os.pathsep + os.environ.get('PATH', '')
-from engine import scan, groups
+from engine import scan, groups, PROFILES
 
 BASE=Path(os.environ.get('APPDATA',Path.home()))/'VidupeNext'
 BASE.mkdir(parents=True,exist_ok=True)
@@ -23,7 +23,7 @@ class App(tk.Tk):
         self.folders=[];self.vids={};self.matches=[];self.groups=[];self.events=queue.Queue();self.stop=threading.Event();self.thumbnails=[]
         self.preview_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='preview')
         self.preview_cache={};self.preview_seq=0;self.active_path=None;self.preview_paths=[None,None];self._preview_resize_job=None
-        self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Group size');self.interval=tk.StringVar(value='6');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
+        self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Group size');self.interval=tk.StringVar(value='6');self.depth=tk.StringVar(value='Standard (48)');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
         self.build();self.after(100,self.poll)
 
     def label(self,parent,text,size=10,color=TEXT,bold=False):
@@ -48,6 +48,8 @@ class App(tk.Tk):
         ttk.Combobox(settings,textvariable=self.sensitivity,values=['Strict','Balanced','Sensitive'],state='readonly',width=15).pack(side='left',padx=(10,24))
         self.label(settings,'Sample every (seconds)',10,MUTED).pack(side='left')
         ttk.Combobox(settings,textvariable=self.interval,values=['3','6','10'],state='readonly',width=7).pack(side='left',padx=10)
+        self.label(settings,'Scan depth',10,MUTED).pack(side='left',padx=(15,4))
+        ttk.Combobox(settings,textvariable=self.depth,values=['Quick (24)','Standard (48)','Deep (120)'],state='readonly',width=13).pack(side='left',padx=4)
         self.label(settings,'Parallel workers',10,MUTED).pack(side='left',padx=(15,4))
         tk.Spinbox(settings,from_=1,to=16,width=3,textvariable=self.workers).pack(side='left')
         self.label(settings,'Minimum score (%)',10,MUTED).pack(side='left',padx=(15,4))
@@ -75,18 +77,30 @@ class App(tk.Tk):
         sb.pack(side='right',fill='y');self.tree.pack(fill='both',expand=True,padx=(10,0),pady=(0,12));self.tree.bind('<<TreeviewSelect>>',self.selected)
         detail=tk.Frame(body,bg=PANEL,padx=12,pady=10);body.add(detail,minsize=520,stretch='always')
         self.label(detail,'REVIEW MATCH  •  Double-click a preview to enlarge',12,TEXT,True).pack(anchor='w',pady=(0,6))
-        self.preview=[]
+        # Bottom widgets are packed FIRST (side='bottom') so the preview area gets all the remaining height.
+        self.label(detail,'Safety: selected files go to the Recycle Bin, never permanently deleted. Review matches first.',9,MUTED).pack(side='bottom',anchor='w',pady=(8,0))
+        buttons=tk.Frame(detail,bg=detail.cget('bg'));buttons.pack(side='bottom',fill='x',pady=4)
+        tk.Button(buttons,text='Open selected file in Explorer',command=self.open_selected,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(side='left',fill='x',expand=True,padx=(0,4))
+        tk.Button(buttons,text='Export matches as CSV',command=self.export,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(side='left',fill='x',expand=True,padx=(4,0))
+        self.score=tk.Label(detail,text='Select a matching pair to view details.',bg=detail.cget('bg'),fg=GREEN,font=('Segoe UI',10),wraplength=600,justify='left')
+        self.score.pack(side='bottom',anchor='w',pady=(8,6))
+        # The two videos are shown SIDE BY SIDE: easier to compare, and each gets the full height of the pane.
+        row=tk.Frame(detail,bg=detail.cget('bg'));row.pack(fill='both',expand=True)
+        row.rowconfigure(0,weight=1);row.columnconfigure(0,weight=1,uniform='previews');row.columnconfigure(1,weight=1,uniform='previews')
+        self.preview=[];self.preview_boxes=[]
         for i in range(2):
-            f=tk.Frame(detail,bg='#111b29',pady=8,padx=9);f.pack(fill='x',pady=6)
-            image=tk.Label(f,bg='#111b29',height=13,fg=MUTED,text='Select a match',font=('Segoe UI',10),cursor='hand2')
-            image.pack(fill='both',expand=True);image.bind('<Double-Button-1>',lambda event,slot=i:self.open_large_preview(slot));name=tk.Label(f,bg='#111b29',fg=TEXT,font=('Segoe UI',10,'bold'),wraplength=350,justify='left');name.pack(anchor='w',pady=(5,2))
-            info=tk.Label(f,bg='#111b29',fg=MUTED,font=('Segoe UI',9),wraplength=350,justify='left');info.pack(anchor='w')
-            self.preview.append((image,name,info))
+            f=tk.Frame(row,bg='#111b29',pady=8,padx=8);f.grid(row=0,column=i,sticky='nsew',padx=(0 if i==0 else 5,5 if i==0 else 0))
+            info=tk.Label(f,bg='#111b29',fg=MUTED,font=('Segoe UI',9),wraplength=270,justify='left',anchor='w');info.pack(side='bottom',anchor='w',fill='x')
+            name=tk.Label(f,bg='#111b29',fg=TEXT,font=('Segoe UI',10,'bold'),wraplength=270,justify='left',anchor='w');name.pack(side='bottom',anchor='w',fill='x',pady=(5,2))
+            # A Label showing an image treats height= as PIXELS (it was 13px, which hid the preview). The picture now
+            # sits inside a stage Frame that expands, and is scaled to the stage's real size.
+            box=tk.Frame(f,bg='#0b121d',height=120,width=200);box.pack(fill='both',expand=True);box.pack_propagate(False);box.grid_propagate(False)
+            image=tk.Label(box,bg='#0b121d',fg=MUTED,text='Select a match',font=('Segoe UI',10),cursor='hand2',wraplength=240)
+            image.place(relx=.5,rely=.5,anchor='center')
+            for w in (image,box):w.bind('<Double-Button-1>',lambda event,slot=i:self.open_large_preview(slot))
+            box.bind('<Configure>',self._schedule_preview_resize)
+            self.preview.append((image,name,info));self.preview_boxes.append(box)
         detail.bind('<Configure>',self._schedule_preview_resize)
-        self.score=self.label(detail,'Select a matching pair to view details.',10,GREEN);self.score.pack(anchor='w',pady=(12,8))
-        tk.Button(detail,text='Open selected file in Explorer',command=self.open_selected,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(fill='x',pady=4)
-        tk.Button(detail,text='Export matches as CSV',command=self.export,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(fill='x',pady=4)
-        self.label(detail,'Safety: selected files go to the Recycle Bin, never permanently deleted. Review matches first.',9,MUTED).pack(anchor='w',pady=16)
         footer=tk.Frame(self,bg=BG,padx=25,pady=8);footer.pack(fill='x')
         self.progress=ttk.Progressbar(footer,mode='determinate');self.progress.pack(fill='x')
         tk.Label(footer,textvariable=self.status,bg=BG,fg=MUTED,font=('Segoe UI',9),anchor='w').pack(fill='x',pady=6)
@@ -105,12 +119,12 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children());self.vids={};self.matches=[];self.groups=[]
         for lbl in self.count_labels:lbl.configure(text='0')
         self.status.set('Discovering videos...')
-        mapping={'Strict':(9,.45),'Balanced':(13,.28),'Sensitive':(17,.22)}; threshold,cover=mapping[self.sensitivity.get()]
+        threshold,cover,_overlap=PROFILES[self.sensitivity.get()]; max_samples=int(self.depth.get().split('(')[1].rstrip(')'))
         workers=int(self.workers.get());interval=float(self.interval.get())
         def worker():
             try:
                 v,m,errors=scan(self.folders,str(BASE/'fingerprints.json'),interval,threshold,cover,
-                    lambda stage,n,total:self.events.put(('progress',stage,n,total)),self.stop,workers)
+                    lambda stage,n,total:self.events.put(('progress',stage,n,total)),self.stop,workers,max_samples)
                 self.events.put(('done',v,m,errors))
             except Exception as e:self.events.put(('error',str(e)))
         threading.Thread(target=worker,daemon=True).start()
@@ -249,9 +263,9 @@ class App(tk.Tk):
             self._render_preview(slot,frame)
 
     def _render_preview(self, slot, frame):
-        label=self.preview[slot][0]
-        width=max(350,label.winfo_width()-12)
-        height=max(170,label.winfo_height()-12)
+        label=self.preview[slot][0];box=self.preview_boxes[slot]
+        width=max(120,box.winfo_width()-8)
+        height=max(100,box.winfo_height()-8)
         # Never upscale pixels beyond the decoded frame size.
         scaled=frame.copy()
         scaled.thumbnail((width,height),Image.Resampling.LANCZOS)
@@ -317,7 +331,7 @@ class App(tk.Tk):
             info.configure(text=f'{v.width} × {v.height} | {v.duration:.1f}s | {v.size/1024**2:.1f} MB\n{path}')
             self._load_preview(path,slot,token)
         if match:
-            self.score.configure(text=f'Match: {match.confidence:.1f}%  |  {match.aligned_frames} aligned frames  |  overlap {match.covered:.0%}')
+            self.score.configure(text=f'Match: {match.confidence:.1f}%  |  {match.aligned_frames} aligned frames  |  overlap {match.covered:.0%}\n{match.evidence}')
         else:
             self.score.configure(text='Select a video or group to review possible duplicates.')
 
