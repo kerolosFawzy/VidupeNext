@@ -1,6 +1,6 @@
 """Vidupe Next desktop application. Python 3.11+, Pillow, numpy, opencv-python."""
 from __future__ import annotations
-import os, sys, threading, queue, subprocess, tkinter as tk
+import os, sys, json, threading, queue, subprocess, tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -13,18 +13,32 @@ from engine import scan, groups, PROFILES
 
 BASE=Path(os.environ.get('APPDATA',Path.home()))/'VidupeNext'
 BASE.mkdir(parents=True,exist_ok=True)
+SETTINGS_FILE=BASE/'settings.json'
+# rule -> (metric, which one to mark): -1 marks the video with the LOWER value, +1 the HIGHER value.
+RULES={
+ 'Lower quality (resolution, then size)':('quality',-1),
+ 'Smaller file size':('size',-1),'Larger file size':('size',1),
+ 'Shorter duration':('duration',-1),'Longer duration':('duration',1),
+ 'Lower resolution':('pixels',-1),'Higher resolution':('pixels',1),
+ 'Older file (modified date)':('mtime',-1),'Newer file (modified date)':('mtime',1)}
 BG='#101723'; PANEL='#192333'; LINE='#334155'; TEXT='#e5edf7'; MUTED='#a3b4c9'; BLUE='#4aa8ff'; GREEN='#41d7a7'
+
+def fmt_dur(seconds):
+    """h:mm:ss (or m:ss for videos under an hour)."""
+    s=int(round(seconds or 0));h,rem=divmod(s,3600);m,sec=divmod(rem,60)
+    return f'{h}:{m:02d}:{sec:02d}' if h else f'{m}:{sec:02d}'
+
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('Vidupe Next  |  Video Duplicate Finder')
         self.geometry('1600x980');self.minsize(1100,740);self.configure(bg=BG)
-        self.folders=[];self.vids={};self.matches=[];self.groups=[];self.marked=set();self.item_path={};self.pair_items={};self.events=queue.Queue();self.stop=threading.Event();self.thumbnails=[]
+        self.folders=[];self.vids={};self.matches=[];self.groups=[];self.marked=set();self.item_path={};self.pair_items={};self.visible_pairs=[];self.events=queue.Queue();self.stop=threading.Event();self.thumbnails=[]
         self.preview_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='preview')
         self.preview_cache={};self.preview_seq=0;self.active_path=None;self.preview_paths=[None,None];self._preview_resize_job=None
-        self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Best match');self.interval=tk.StringVar(value='6');self.depth=tk.StringVar(value='Standard (48)');self.mode=tk.StringVar(value='Fast');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
-        self.build();self.after(100,self.poll)
+        self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Best match');self.interval=tk.StringVar(value='6');self.depth=tk.StringVar(value='Standard (48)');self.mode=tk.StringVar(value='Fast');self.auto_rule=tk.StringVar(value='Lower quality (resolution, then size)');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
+        self.build();self.load_settings();self.protocol('WM_DELETE_WINDOW',self.on_close);self.after(100,self.poll)
 
     def label(self,parent,text,size=10,color=TEXT,bold=False):
         return tk.Label(parent,text=text,bg=parent.cget('bg'),fg=color,font=('Segoe UI',size,'bold' if bold else 'normal'))
@@ -64,28 +78,35 @@ class App(tk.Tk):
             f=tk.Frame(cards,bg=PANEL,padx=17,pady=10,highlightbackground=LINE,highlightthickness=1);f.pack(side='left',fill='x',expand=True,padx=3)
             self.label(f,title,10,MUTED).pack(anchor='w');val=self.label(f,'0',20,TEXT,True);val.pack(anchor='w',pady=(3,0));self.count_labels.append(val)
         body=tk.PanedWindow(self,orient=tk.HORIZONTAL,bg=BG,sashwidth=5,bd=0);body.pack(fill='both',expand=True,padx=22,pady=14)
-        results=tk.Frame(body,bg=PANEL);body.add(results,minsize=420,stretch='always')
-        self.label(results,'MATCHED PAIRS  •  Tick the video you want to delete in each pair',12,TEXT,True).pack(anchor='w',padx=14,pady=8)
-        actions=tk.Frame(results,bg=PANEL);actions.pack(fill='x',padx=8,pady=5)
-        ttk.Combobox(actions,textvariable=self.sort_by,values=['Best match','Potential savings','Name'],state='readonly',width=15).pack(side='left',padx=4)
+        results=tk.Frame(body,bg=PANEL);body.add(results,minsize=600,stretch='always')
+        self.label(results,'MATCHED PAIRS  •  Tick the video to delete',12,TEXT,True).pack(anchor='w',padx=14,pady=8)
+        actions=tk.Frame(results,bg=PANEL);actions.pack(fill='x',padx=8,pady=(5,2))
+        ttk.Combobox(actions,textvariable=self.sort_by,values=['Best match','Potential savings','Biggest length difference','Name'],state='readonly',width=22).pack(side='left',padx=4)
         tk.Button(actions,text='Sort',command=self.filter_results,bg=LINE,fg=TEXT).pack(side='left',padx=4)
-        tk.Button(actions,text='Auto-mark lower quality',command=self.mark_worse,bg='#34587c',fg=TEXT).pack(side='left',padx=4)
         tk.Button(actions,text='Clear marks',command=self.clear_marks,bg=LINE,fg=TEXT).pack(side='left',padx=4)
         self.recycle_btn=tk.Button(actions,text='Recycle marked (0)',command=self.recycle_selected,bg='#a74040',fg='white');self.recycle_btn.pack(side='right',padx=4)
-        cols=('delete','res','size');self.tree=ttk.Treeview(results,columns=cols,show='tree headings',selectmode='browse')
-        self.tree.heading('#0',text='Pair / video');self.tree.column('#0',width=300,minwidth=200)
-        for k,t,w in [('delete','Delete',70),('res','Resolution',95),('size','Size',80)]:
+        rules=tk.Frame(results,bg=PANEL);rules.pack(fill='x',padx=8,pady=(2,5))
+        self.label(rules,'Mark in every pair:',10,MUTED).pack(side='left',padx=(4,4))
+        ttk.Combobox(rules,textvariable=self.auto_rule,values=list(RULES),state='readonly',width=34).pack(side='left',padx=4)
+        tk.Button(rules,text='Mark',command=lambda:self.auto_mark(self.auto_rule.get()),bg='#34587c',fg=TEXT).pack(side='left',padx=4)
+        cols=('delete','res','dur','size');self.tree=ttk.Treeview(results,columns=cols,show='tree headings',selectmode='browse')
+        self.tree.heading('#0',text='Pair / video');self.tree.column('#0',width=260,minwidth=180)
+        for k,t,w in [('delete','Delete',72),('res','Resolution',92),('dur','Duration',84),('size','Size',76)]:
             self.tree.heading(k,text=t);self.tree.column(k,width=w,minwidth=60,anchor='center')
         self.tree.tag_configure('marked',foreground='#ff8a80');self.tree.tag_configure('pair',font=('Segoe UI',10,'bold'))
         sb=ttk.Scrollbar(results,orient='vertical',command=self.tree.yview);self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side='right',fill='y');self.tree.pack(fill='both',expand=True,padx=(10,0),pady=(0,12));self.tree.bind('<<TreeviewSelect>>',self.selected)
-        self.tree.bind('<Button-1>',self._tree_click);self.tree.bind('<space>',self._tree_space)
-        detail=tk.Frame(body,bg=PANEL,padx=12,pady=10);body.add(detail,minsize=520,stretch='always')
+        self.tree.bind('<Button-1>',self._tree_click);self.tree.bind('<space>',self._tree_space);self.tree.bind('<Double-Button-1>',self._tree_double)
+        self.tree.bind('<Button-3>',self._tree_menu);self.tree.bind('<Button-2>',self._tree_menu)
+        self.tree.bind('<Return>',lambda e:self.play_path(self.item_path.get(self.tree.focus())))
+        self.tree.bind('<Delete>',self._tree_space);self.tree.bind('1',lambda e:self._key_mark(0));self.tree.bind('2',lambda e:self._key_mark(1))
+        detail=tk.Frame(body,bg=PANEL,padx=12,pady=10);body.add(detail,minsize=470,stretch='always')
         self.label(detail,'COMPARE  •  Double-click a preview to enlarge',12,TEXT,True).pack(anchor='w',pady=(0,6))
         # Bottom widgets are packed FIRST (side='bottom') so the preview area gets all the remaining height.
-        self.label(detail,'Safety: selected files go to the Recycle Bin, never permanently deleted. Review matches first.',9,MUTED).pack(side='bottom',anchor='w',pady=(8,0))
+        hint=self.label(detail,'Files go to the Recycle Bin, never permanently deleted.  Keys: 1 / 2 mark the left / right video, Space ticks, Enter plays.  Right-click a row for more.',9,MUTED)
+        hint.configure(wraplength=440,justify='left');hint.pack(side='bottom',anchor='w',pady=(8,0));self.hint=hint
         buttons=tk.Frame(detail,bg=detail.cget('bg'));buttons.pack(side='bottom',fill='x',pady=4)
-        tk.Button(buttons,text='Open selected file in Explorer',command=self.open_selected,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(side='left',fill='x',expand=True,padx=(0,4))
+        tk.Button(buttons,text='Open folder of selected video',command=self.open_selected,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(side='left',fill='x',expand=True,padx=(0,4))
         tk.Button(buttons,text='Export matches as CSV',command=self.export,bg=LINE,fg=TEXT,relief='flat',pady=9).pack(side='left',fill='x',expand=True,padx=(4,0))
         self.score=tk.Label(detail,text='Select a matching pair to view details.',bg=detail.cget('bg'),fg=GREEN,font=('Segoe UI',10),wraplength=600,justify='left')
         self.score.pack(side='bottom',anchor='w',pady=(8,6))
@@ -98,6 +119,9 @@ class App(tk.Tk):
             var=tk.BooleanVar(value=False);self.slot_vars.append(var)
             tk.Checkbutton(f,text='Delete this video',variable=var,command=lambda slot=i:self._toggle_slot(slot),bg='#111b29',fg='#ff8a80',selectcolor='#0b121d',
                 activebackground='#111b29',activeforeground='#ff8a80',font=('Segoe UI',10,'bold'),anchor='w').pack(side='bottom',anchor='w',fill='x',pady=(4,0))
+            row_btn=tk.Frame(f,bg='#111b29');row_btn.pack(side='bottom',fill='x',pady=(4,0))
+            tk.Button(row_btn,text='▶ Play',command=lambda slot=i:self.play_path(self.preview_paths[slot]),bg=LINE,fg=TEXT,relief='flat',pady=3).pack(side='left',fill='x',expand=True,padx=(0,3))
+            tk.Button(row_btn,text='📁 Folder',command=lambda slot=i:self.reveal_path(self.preview_paths[slot]),bg=LINE,fg=TEXT,relief='flat',pady=3).pack(side='left',fill='x',expand=True,padx=(3,0))
             info=tk.Label(f,bg='#111b29',fg=MUTED,font=('Segoe UI',9),wraplength=270,justify='left',anchor='w');info.pack(side='bottom',anchor='w',fill='x')
             name=tk.Label(f,bg='#111b29',fg=TEXT,font=('Segoe UI',10,'bold'),wraplength=270,justify='left',anchor='w');name.pack(side='bottom',anchor='w',fill='x',pady=(5,2))
             # A Label showing an image treats height= as PIXELS (it was 13px, which hid the preview). The picture now
@@ -109,6 +133,7 @@ class App(tk.Tk):
             box.bind('<Configure>',self._schedule_preview_resize)
             self.preview.append((image,name,info));self.preview_boxes.append(box)
         detail.bind('<Configure>',self._schedule_preview_resize)
+        detail.bind('<Configure>',self._fit_labels,add='+')
         footer=tk.Frame(self,bg=BG,padx=25,pady=8);footer.pack(fill='x')
         self.progress=ttk.Progressbar(footer,mode='determinate');self.progress.pack(fill='x')
         tk.Label(footer,textvariable=self.status,bg=BG,fg=MUTED,font=('Segoe UI',9),anchor='w').pack(fill='x',pady=6)
@@ -116,14 +141,18 @@ class App(tk.Tk):
     def add_folder(self):
         p=filedialog.askdirectory()
         if p and p not in self.folders:self.folders.append(p)
-        self.folderlabel.configure(text=' | '.join(self.folders)[:105] or 'No folders selected')
+        self._update_folder_label()
 
-    def clear_folders(self):self.folders=[];self.folderlabel.configure(text='No folders selected')
+    def _update_folder_label(self):
+        n=len(self.folders)
+        self.folderlabel.configure(text=(f'{n} folder'+('s' if n!=1 else '')+': '+' | '.join(self.folders))[:110] if n else 'No folders selected')
+
+    def clear_folders(self):self.folders=[];self._update_folder_label()
 
     def start_scan(self):
         if not self.folders:messagebox.showinfo('No folders','Please add at least one folder.');return
         if self.startbtn.cget('text')=='STOP SCAN':self.stop.set();self.status.set('Stopping after current operations...');return
-        self.stop.clear();self.startbtn.configure(text='STOP SCAN',bg='#f5aa5b')
+        self.stop.clear();self.save_settings();self.startbtn.configure(text='STOP SCAN',bg='#f5aa5b')
         self.tree.delete(*self.tree.get_children());self.vids={};self.matches=[];self.groups=[];self.marked=set();self.item_path={};self.pair_items={};self.visible_pairs=[]
         for lbl in self.count_labels:lbl.configure(text='0')
         self.status.set('Discovering videos...')
@@ -180,6 +209,7 @@ class App(tk.Tk):
         def saving(m):return min(size(m.left),size(m.right))
         sort=self.sort_by.get()
         if sort=='Potential savings':visible.sort(key=saving,reverse=True)
+        elif sort=='Biggest length difference':visible.sort(key=lambda m:abs(self.vids[m.left].duration-self.vids[m.right].duration),reverse=True)
         elif sort=='Name':visible.sort(key=lambda m:os.path.basename(m.left).lower())
         else:visible.sort(key=lambda m:m.confidence,reverse=True)
         self.visible_pairs=visible
@@ -187,12 +217,12 @@ class App(tk.Tk):
             # Better-quality file first (more pixels, then bigger file).
             a,b=sorted((m.left,m.right),key=self._quality,reverse=True)
             pid=f'p{i}'
-            self.tree.insert('','end',iid=pid,text=f'Pair {i+1}  |  {m.confidence:.0f}% match',values=('','',f'{saving(m)/1024**2:.0f} MB'),open=True,tags=('pair',))
+            self.tree.insert('','end',iid=pid,text=f'Pair {i+1}  |  {m.confidence:.0f}% match',values=('','',('same' if abs(self.vids[m.left].duration-self.vids[m.right].duration)<1.5 else 'Δ '+fmt_dur(abs(self.vids[m.left].duration-self.vids[m.right].duration))),f'{saving(m)/1024**2:.0f} MB'),open=True,tags=('pair',))
             self.pair_items[pid]=(m,[a,b])
             for j,path in enumerate((a,b)):
                 vid=self.vids[path];iid=f'v{i}_{j}';self.item_path[iid]=path
                 self.tree.insert(pid,'end',iid=iid,text=('★ ' if j==0 else '   ')+os.path.basename(path),
-                    values=('☐',f'{vid.width}×{vid.height}',f'{size(path)/1024**2:.1f} MB'))
+                    values=('☐',f'{vid.width}×{vid.height}',fmt_dur(vid.duration),f'{size(path)/1024**2:.1f} MB'))
         self.refresh_marks()
         self.status.set(f'Showing {len(visible)} pairs at {floor:.0f}% match or higher. ★ = suggested keeper. Tick "Delete" on the video to remove.')
 
@@ -219,6 +249,17 @@ class App(tk.Tk):
         else:self.marked.add(path)
         self.refresh_marks()
 
+    def _fit_labels(self,event=None):
+        """Wrap long labels to the real width of the compare pane so nothing is cut off in narrow windows."""
+        width=self.preview_boxes[0].master.master.master.winfo_width() if self.preview_boxes else 0
+        if width<200:return
+        self.score.configure(wraplength=width-24);self.hint.configure(wraplength=width-24)
+        for _,name,info in self.preview:
+            name.configure(wraplength=max(120,width//2-34));info.configure(wraplength=max(120,width//2-34))
+
+    def unmark_paths(self,paths):
+        self.marked-=set(paths);self.refresh_marks()
+
     def _toggle_slot(self,slot):
         path=self.preview_paths[slot] if slot<len(self.preview_paths) else None
         if path:self.toggle_path(path)
@@ -233,13 +274,125 @@ class App(tk.Tk):
         iid=self.tree.focus()
         if iid in self.item_path:self.toggle_path(self.item_path[iid]);return 'break'
 
-    def mark_worse(self):
-        """Mark the lower-quality video of every visible pair. The best file of any set of related videos is never marked."""
-        for m in getattr(self,'visible_pairs',[]):
-            a,b=sorted((m.left,m.right),key=self._quality,reverse=True)
-            self.marked.add(b)
+    def _metric(self,path,metric):
+        v=self.vids[path]
+        if metric=='size':return v.size
+        if metric=='duration':return v.duration
+        if metric=='pixels':return v.width*v.height
+        if metric=='mtime':
+            try:return os.path.getmtime(path)
+            except OSError:return 0
+        return v.width*v.height
+
+    def _pick(self,rule,a,b):
+        """Which of two videos does `rule` mark for deletion? None when they tie (nothing is marked)."""
+        metric,direction=RULES[rule]
+        if metric=='quality':                       # resolution first, then file size
+            pa,pb=self._metric(a,'pixels'),self._metric(b,'pixels')
+            if pa!=pb:lo,hi=(a,b) if pa<pb else (b,a);return lo
+            metric,direction='size',-1
+        x,y=self._metric(a,metric),self._metric(b,metric)
+        tol={'size':.01*max(x,y),'duration':1.0,'pixels':0,'mtime':2.0}[metric]
+        if abs(x-y)<=tol:return None
+        lower,higher=(a,b) if x<y else (b,a)
+        return lower if direction<0 else higher
+
+    def auto_mark(self,rule,pairs=None):
+        """Apply one rule to every visible pair (adds to existing marks). Ties are skipped and counted."""
+        if rule not in RULES:return
+        added=skipped=0;pairs=pairs if pairs is not None else getattr(self,'visible_pairs',[])
+        for m in pairs:
+            pick=self._pick(rule,m.left,m.right)
+            if pick is None:skipped+=1
+            elif pick not in self.marked:self.marked.add(pick);added+=1
         self.refresh_marks()
-        self.status.set(f'{len(self.marked)} lower-quality videos marked. Review each pair before recycling.')
+        self.status.set(f'"{rule}": marked {added} video(s), skipped {skipped} pair(s) that tie. Marked in total: {len(self.marked)}. Review before recycling.')
+        return added,skipped
+
+    def mark_worse(self):
+        return self.auto_mark('Lower quality (resolution, then size)')
+
+    # ---- opening files
+    def play_path(self,path):
+        if not path or not os.path.isfile(path):return
+        try:
+            if sys.platform=='win32':os.startfile(os.path.normpath(path))
+            elif sys.platform=='darwin':subprocess.Popen(['open',path])
+            else:subprocess.Popen(['xdg-open',path])
+        except Exception as e:messagebox.showerror('Play video',str(e))
+
+    def reveal_path(self,path):
+        if not path:return
+        try:
+            if sys.platform=='win32':subprocess.Popen(['explorer','/select,',os.path.normpath(path)])
+            elif sys.platform=='darwin':subprocess.Popen(['open','-R',path])
+            else:subprocess.Popen(['xdg-open',os.path.dirname(path)])
+        except Exception as e:messagebox.showerror('Open folder',str(e))
+
+    def _pair_of(self,iid):
+        pid=iid if iid in self.pair_items else self.tree.parent(iid)
+        return pid if pid in self.pair_items else None
+
+    def _tree_double(self,event):
+        iid=self.tree.identify_row(event.y)
+        if iid in self.item_path and self.tree.identify_column(event.x)!='#1':self.play_path(self.item_path[iid])
+
+    def _key_mark(self,index):
+        """Keys 1 / 2: toggle the first / second video of the pair that is currently selected."""
+        pid=self._pair_of(self.tree.focus())
+        if pid:self.toggle_path(self.pair_items[pid][1][index]);return 'break'
+
+    def _menu_entries(self,iid):
+        """[(label, callback)] for the right-click menu of a row (None = separator)."""
+        pid=self._pair_of(iid)
+        if not pid:return []
+        match,paths=self.pair_items[pid];path=self.item_path.get(iid)
+        entries=[]
+        if path:
+            other=paths[1] if path==paths[0] else paths[0]
+            entries+=[('▶ Play video',lambda:self.play_path(path)),('📁 Open folder location',lambda:self.reveal_path(path)),None,
+                      (('Unmark' if path in self.marked else 'Mark for deletion'),lambda:self.toggle_path(path)),
+                      (f'Mark the OTHER video ({os.path.basename(other)[:30]})',lambda:self.toggle_path(other))]
+        else:
+            entries+=[(f'▶ Play {os.path.basename(p)[:28]}',(lambda p=p:self.play_path(p))) for p in paths]
+            entries+=[None]+[(f'Mark lower quality in this pair',lambda:self.auto_mark('Lower quality (resolution, then size)',[match])),
+                             ('Unmark both videos',lambda:self.unmark_paths(paths))]
+        return entries
+
+    def _tree_menu(self,event):
+        iid=self.tree.identify_row(event.y)
+        if not iid:return
+        self.tree.selection_set(iid);self.tree.focus(iid)
+        menu=tk.Menu(self,tearoff=0)
+        for e in self._menu_entries(iid):
+            if e is None:menu.add_separator()
+            else:menu.add_command(label=e[0],command=e[1])
+        try:menu.tk_popup(event.x_root,event.y_root)
+        finally:menu.grab_release()
+
+    # ---- remembered settings
+    def save_settings(self):
+        try:
+            data={'folders':self.folders,'sensitivity':self.sensitivity.get(),'interval':self.interval.get(),'mode':self.mode.get(),'depth':self.depth.get(),
+                  'workers':int(self.workers.get()),'min_score':float(self.min_score.get()),'sort':self.sort_by.get(),'rule':self.auto_rule.get()}
+            SETTINGS_FILE.write_text(json.dumps(data,indent=1),encoding='utf-8')
+        except Exception:pass
+
+    def load_settings(self):
+        try:data=json.loads(SETTINGS_FILE.read_text(encoding='utf-8'))
+        except Exception:return
+        def put(var,key,allowed=None):
+            v=data.get(key)
+            if v is not None and (allowed is None or v in allowed):
+                try:var.set(v)
+                except Exception:pass
+        put(self.sensitivity,'sensitivity',list(PROFILES));put(self.mode,'mode',['Fast','Thorough']);put(self.interval,'interval',['3','6','10'])
+        put(self.depth,'depth',['Quick (24)','Standard (48)','Deep (120)']);put(self.sort_by,'sort',['Best match','Potential savings','Biggest length difference','Name'])
+        put(self.auto_rule,'rule',list(RULES));put(self.workers,'workers');put(self.min_score,'min_score')
+        self.folders=[f for f in data.get('folders',[]) if os.path.isdir(f)];self._update_folder_label()
+
+    def on_close(self):
+        self.save_settings();self.destroy()
 
     def clear_marks(self):
         self.marked.clear();self.refresh_marks();self.status.set('All marks cleared.')
@@ -377,7 +530,7 @@ class App(tk.Tk):
             image.configure(image='',text='Loading thumbnail...')
             image.image=None
             name.configure(text=os.path.basename(path))
-            info.configure(text=f'{v.width} × {v.height} | {v.duration:.1f}s | {v.size/1024**2:.1f} MB\n{path}')
+            info.configure(text=f'{v.width} × {v.height} | duration {fmt_dur(v.duration)} | {v.size/1024**2:.1f} MB\n{path}')
             self._load_preview(path,slot,token)
         self.refresh_marks()
         if match:
@@ -396,13 +549,7 @@ class App(tk.Tk):
         self._display_pair(paths,match)
 
     def open_selected(self):
-        if not hasattr(self,'active_path'):return
-        p=self.active_path
-        try:
-            if sys.platform=='win32':subprocess.Popen(['explorer','/select,',os.path.normpath(p)])
-            elif sys.platform=='darwin':subprocess.Popen(['open','-R',p])
-            else:subprocess.Popen(['xdg-open',os.path.dirname(p)])
-        except Exception as e:messagebox.showerror('Explorer',str(e))
+        self.reveal_path(getattr(self,'active_path',None))
 
     def export(self):
         if not self.matches:return
@@ -410,8 +557,12 @@ class App(tk.Tk):
         if not p:return
         import csv
         with open(p,'w',encoding='utf-8-sig',newline='') as f:
-            w=csv.writer(f);w.writerow(['video_a','video_b','confidence_estimate','aligned_frames','shorter_video_coverage','offset_seconds','evidence'])
-            for m in self.matches:w.writerow([m.left,m.right,m.confidence,m.aligned_frames,m.covered,m.offset_seconds,m.evidence])
+            w=csv.writer(f);w.writerow(['video_a','video_b','confidence_estimate','duration_a','duration_b','size_a_mb','size_b_mb','marked_a','marked_b','aligned_frames','overlap_share','offset_seconds','evidence'])
+            for m in self.matches:
+                va,vb=self.vids.get(m.left),self.vids.get(m.right)
+                w.writerow([m.left,m.right,m.confidence,fmt_dur(va.duration) if va else '',fmt_dur(vb.duration) if vb else '',
+                            f'{va.size/1024**2:.1f}' if va else '',f'{vb.size/1024**2:.1f}' if vb else '',
+                            'yes' if m.left in self.marked else '','yes' if m.right in self.marked else '',m.aligned_frames,m.covered,m.offset_seconds,m.evidence])
         messagebox.showinfo('Export','Saved matches as CSV. No videos were changed.')
 
 if __name__=='__main__':App().mainloop()

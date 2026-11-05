@@ -1,4 +1,19 @@
-# Vidupe Next v7.2: pair review + faster scanning + matching engine rewrite + preview fix
+# Vidupe Next v7.4: smarter marking, play/open folder, shortcuts, remembered settings (+ pair review, fast scan, new engine)
+
+## v7.4 (new)
+* **"Mark in every pair"**: pick a rule and click Mark. Rules: lower quality (resolution, then size), smaller / larger file
+  size, shorter / longer duration, lower / higher resolution, older / newer file. Each rule marks one video per pair.
+  Pairs that tie (durations within 1 s, sizes within 1%, same resolution, same timestamp) are skipped and counted in the
+  status bar, so the app never guesses. Rules add to your marks; "Clear marks" resets.
+* **Open the video / its folder:** double-click a video row to play it in your default player. Each preview has
+  **Play** and **Folder** buttons (Folder opens the file's location, selected in Explorer on Windows).
+* **Right-click menu** on a video row (play, open folder, mark/unmark, mark the other video) and on a pair row
+  (play either, mark lower quality, unmark both).
+* **Keyboard:** 1 / 2 mark the left / right video of the selected pair, Space or Delete ticks the highlighted row, Enter plays it.
+* **Settings are remembered** between sessions (folders, accuracy, scan mode/depth, workers, minimum score, sort, last rule).
+* **More sort options** (biggest length difference) and a **richer CSV export** (durations, sizes, and which videos are marked).
+* Layout: labels wrap to the pane width and the list columns fit in small windows.
+
 
 ## v7.2: compare video to video, choose what to delete (new)
 * Results are now **one row per matched pair, always exactly two videos**. A chain such as A~B, B~C, A~C is shown as
@@ -11,6 +26,8 @@
 * Safety kept: files go to the Recycle Bin; you cannot mark every video of a set of related videos (at least one copy is
   always kept); the confirmation dialog warns when both videos of a pair are marked.
 * Settings bar split into two rows so nothing is cut off.
+* **Duration** is shown for every video (h:mm:ss) in the list and under each preview. Each pair row also shows
+  "same length" or the length difference (e.g. "Δ 1:02"), which helps tell a full copy from a trimmed clip.
 
 
 ## v7.1: scan speed (new)
