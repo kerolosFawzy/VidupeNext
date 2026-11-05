@@ -20,10 +20,10 @@ class App(tk.Tk):
         super().__init__()
         self.title('Vidupe Next  |  Video Duplicate Finder')
         self.geometry('1600x980');self.minsize(1100,740);self.configure(bg=BG)
-        self.folders=[];self.vids={};self.matches=[];self.groups=[];self.events=queue.Queue();self.stop=threading.Event();self.thumbnails=[]
+        self.folders=[];self.vids={};self.matches=[];self.groups=[];self.marked=set();self.item_path={};self.pair_items={};self.events=queue.Queue();self.stop=threading.Event();self.thumbnails=[]
         self.preview_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='preview')
         self.preview_cache={};self.preview_seq=0;self.active_path=None;self.preview_paths=[None,None];self._preview_resize_job=None
-        self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Group size');self.interval=tk.StringVar(value='6');self.depth=tk.StringVar(value='Standard (48)');self.mode=tk.StringVar(value='Fast');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
+        self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Best match');self.interval=tk.StringVar(value='6');self.depth=tk.StringVar(value='Standard (48)');self.mode=tk.StringVar(value='Fast');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
         self.build();self.after(100,self.poll)
 
     def label(self,parent,text,size=10,color=TEXT,bold=False):
@@ -43,7 +43,7 @@ class App(tk.Tk):
         self.folderlabel=self.label(toolbar,'No folders selected',10,MUTED);self.folderlabel.pack(side='left',padx=12)
         self.startbtn=tk.Button(toolbar,text='SCAN VIDEOS',command=self.start_scan,bg=GREEN,fg='#062016',font=('Segoe UI',10,'bold'),relief='flat',padx=18,pady=9)
         self.startbtn.pack(side='right')
-        settings=tk.Frame(self,bg=BG,padx=22,pady=13);settings.pack(fill='x')
+        settings=tk.Frame(self,bg=BG,padx=22,pady=(10));settings.pack(fill='x')
         self.label(settings,'Matching accuracy',10,MUTED).pack(side='left')
         ttk.Combobox(settings,textvariable=self.sensitivity,values=['Strict','Balanced','Sensitive'],state='readonly',width=15).pack(side='left',padx=(10,24))
         self.label(settings,'Sample every (seconds)',10,MUTED).pack(side='left')
@@ -52,33 +52,36 @@ class App(tk.Tk):
         ttk.Combobox(settings,textvariable=self.mode,values=['Fast','Thorough'],state='readonly',width=9).pack(side='left',padx=4)
         self.label(settings,'Scan depth',10,MUTED).pack(side='left',padx=(15,4))
         ttk.Combobox(settings,textvariable=self.depth,values=['Quick (24)','Standard (48)','Deep (120)'],state='readonly',width=13).pack(side='left',padx=4)
-        self.label(settings,'Parallel workers',10,MUTED).pack(side='left',padx=(15,4))
-        tk.Spinbox(settings,from_=1,to=16,width=3,textvariable=self.workers).pack(side='left')
-        self.label(settings,'Minimum score (%)',10,MUTED).pack(side='left',padx=(15,4))
-        tk.Spinbox(settings,from_=0,to=99,increment=5,width=4,textvariable=self.min_score).pack(side='left')
-        tk.Button(settings,text='Apply result filter',command=self.filter_results,bg=LINE,fg=TEXT,relief='flat').pack(side='left',padx=8)
+        settings2=tk.Frame(self,bg=BG,padx=22,pady=0);settings2.pack(fill='x')
+        self.label(settings2,'Parallel workers',10,MUTED).pack(side='left')
+        tk.Spinbox(settings2,from_=1,to=16,width=3,textvariable=self.workers).pack(side='left',padx=(10,24))
+        self.label(settings2,'Show pairs with match score of at least (%)',10,MUTED).pack(side='left')
+        tk.Spinbox(settings2,from_=0,to=99,increment=5,width=4,textvariable=self.min_score).pack(side='left',padx=10)
+        tk.Button(settings2,text='Apply filter',command=self.filter_results,bg=LINE,fg=TEXT,relief='flat').pack(side='left',padx=8)
         cards=tk.Frame(self,bg=BG,padx=20);cards.pack(fill='x')
         self.count_labels=[]
-        for title in ['Videos scanned','Possible matches','Duplicate groups','Potential savings']:
+        for title in ['Videos scanned','Matched pairs','Marked for deletion','Space to free']:
             f=tk.Frame(cards,bg=PANEL,padx=17,pady=10,highlightbackground=LINE,highlightthickness=1);f.pack(side='left',fill='x',expand=True,padx=3)
             self.label(f,title,10,MUTED).pack(anchor='w');val=self.label(f,'0',20,TEXT,True);val.pack(anchor='w',pady=(3,0));self.count_labels.append(val)
         body=tk.PanedWindow(self,orient=tk.HORIZONTAL,bg=BG,sashwidth=5,bd=0);body.pack(fill='both',expand=True,padx=22,pady=14)
         results=tk.Frame(body,bg=PANEL);body.add(results,minsize=420,stretch='always')
-        self.label(results,'DUPLICATE GROUPS  •  Select files to remove',12,TEXT,True).pack(anchor='w',padx=14,pady=8)
+        self.label(results,'MATCHED PAIRS  •  Tick the video you want to delete in each pair',12,TEXT,True).pack(anchor='w',padx=14,pady=8)
         actions=tk.Frame(results,bg=PANEL);actions.pack(fill='x',padx=8,pady=5)
-        ttk.Combobox(actions,textvariable=self.sort_by,values=['Group size','Potential savings','Best similarity','Group name'],state='readonly',width=17).pack(side='left',padx=4)
+        ttk.Combobox(actions,textvariable=self.sort_by,values=['Best match','Potential savings','Name'],state='readonly',width=15).pack(side='left',padx=4)
         tk.Button(actions,text='Sort',command=self.filter_results,bg=LINE,fg=TEXT).pack(side='left',padx=4)
-        tk.Button(actions,text='Select all copies',command=self.select_copies,bg='#34587c',fg=TEXT).pack(side='left',padx=4)
-        tk.Button(actions,text='Clear selection',command=lambda:self.tree.selection_remove(*self.tree.selection()),bg=LINE,fg=TEXT).pack(side='left',padx=4)
-        tk.Button(actions,text='Recycle selected',command=self.recycle_selected,bg='#a74040',fg='white').pack(side='right',padx=4)
-        cols=('similarity','files','size');self.tree=ttk.Treeview(results,columns=cols,show='tree headings',selectmode='extended')
-        self.tree.heading('#0',text='Video / group');self.tree.column('#0',width=300,minwidth=200)
-        for k,t,w in [('similarity','Match',85),('files','Resolution',95),('size','Size',80)]:
+        tk.Button(actions,text='Auto-mark lower quality',command=self.mark_worse,bg='#34587c',fg=TEXT).pack(side='left',padx=4)
+        tk.Button(actions,text='Clear marks',command=self.clear_marks,bg=LINE,fg=TEXT).pack(side='left',padx=4)
+        self.recycle_btn=tk.Button(actions,text='Recycle marked (0)',command=self.recycle_selected,bg='#a74040',fg='white');self.recycle_btn.pack(side='right',padx=4)
+        cols=('delete','res','size');self.tree=ttk.Treeview(results,columns=cols,show='tree headings',selectmode='browse')
+        self.tree.heading('#0',text='Pair / video');self.tree.column('#0',width=300,minwidth=200)
+        for k,t,w in [('delete','Delete',70),('res','Resolution',95),('size','Size',80)]:
             self.tree.heading(k,text=t);self.tree.column(k,width=w,minwidth=60,anchor='center')
+        self.tree.tag_configure('marked',foreground='#ff8a80');self.tree.tag_configure('pair',font=('Segoe UI',10,'bold'))
         sb=ttk.Scrollbar(results,orient='vertical',command=self.tree.yview);self.tree.configure(yscrollcommand=sb.set)
         sb.pack(side='right',fill='y');self.tree.pack(fill='both',expand=True,padx=(10,0),pady=(0,12));self.tree.bind('<<TreeviewSelect>>',self.selected)
+        self.tree.bind('<Button-1>',self._tree_click);self.tree.bind('<space>',self._tree_space)
         detail=tk.Frame(body,bg=PANEL,padx=12,pady=10);body.add(detail,minsize=520,stretch='always')
-        self.label(detail,'REVIEW MATCH  •  Double-click a preview to enlarge',12,TEXT,True).pack(anchor='w',pady=(0,6))
+        self.label(detail,'COMPARE  •  Double-click a preview to enlarge',12,TEXT,True).pack(anchor='w',pady=(0,6))
         # Bottom widgets are packed FIRST (side='bottom') so the preview area gets all the remaining height.
         self.label(detail,'Safety: selected files go to the Recycle Bin, never permanently deleted. Review matches first.',9,MUTED).pack(side='bottom',anchor='w',pady=(8,0))
         buttons=tk.Frame(detail,bg=detail.cget('bg'));buttons.pack(side='bottom',fill='x',pady=4)
@@ -89,9 +92,12 @@ class App(tk.Tk):
         # The two videos are shown SIDE BY SIDE: easier to compare, and each gets the full height of the pane.
         row=tk.Frame(detail,bg=detail.cget('bg'));row.pack(fill='both',expand=True)
         row.rowconfigure(0,weight=1);row.columnconfigure(0,weight=1,uniform='previews');row.columnconfigure(1,weight=1,uniform='previews')
-        self.preview=[];self.preview_boxes=[]
+        self.preview=[];self.preview_boxes=[];self.slot_vars=[]
         for i in range(2):
             f=tk.Frame(row,bg='#111b29',pady=8,padx=8);f.grid(row=0,column=i,sticky='nsew',padx=(0 if i==0 else 5,5 if i==0 else 0))
+            var=tk.BooleanVar(value=False);self.slot_vars.append(var)
+            tk.Checkbutton(f,text='Delete this video',variable=var,command=lambda slot=i:self._toggle_slot(slot),bg='#111b29',fg='#ff8a80',selectcolor='#0b121d',
+                activebackground='#111b29',activeforeground='#ff8a80',font=('Segoe UI',10,'bold'),anchor='w').pack(side='bottom',anchor='w',fill='x',pady=(4,0))
             info=tk.Label(f,bg='#111b29',fg=MUTED,font=('Segoe UI',9),wraplength=270,justify='left',anchor='w');info.pack(side='bottom',anchor='w',fill='x')
             name=tk.Label(f,bg='#111b29',fg=TEXT,font=('Segoe UI',10,'bold'),wraplength=270,justify='left',anchor='w');name.pack(side='bottom',anchor='w',fill='x',pady=(5,2))
             # A Label showing an image treats height= as PIXELS (it was 13px, which hid the preview). The picture now
@@ -118,7 +124,7 @@ class App(tk.Tk):
         if not self.folders:messagebox.showinfo('No folders','Please add at least one folder.');return
         if self.startbtn.cget('text')=='STOP SCAN':self.stop.set();self.status.set('Stopping after current operations...');return
         self.stop.clear();self.startbtn.configure(text='STOP SCAN',bg='#f5aa5b')
-        self.tree.delete(*self.tree.get_children());self.vids={};self.matches=[];self.groups=[]
+        self.tree.delete(*self.tree.get_children());self.vids={};self.matches=[];self.groups=[];self.marked=set();self.item_path={};self.pair_items={};self.visible_pairs=[]
         for lbl in self.count_labels:lbl.configure(text='0')
         self.status.set('Discovering videos...')
         threshold,cover,_overlap=PROFILES[self.sensitivity.get()]; max_samples=int(self.depth.get().split('(')[1].rstrip(')'));thorough=self.mode.get()=='Thorough'
@@ -149,69 +155,109 @@ class App(tk.Tk):
 
     def render(self,vids,matches,errors):
         self.vids={v.path:v for v in vids};self.matches=matches;self.groups=groups(matches);self.filter_results()
-        seen=set();saving=0
-        for g in self.groups:
-            if len(g)<2:continue
-            sizes=sorted((self.vids[x].size for x in g if x in self.vids),reverse=True)
-            if sizes:saving+=sum(sizes[1:])
-        # Result rendering is handled by filter_results, including individual selectable files.
-        stats=[str(len(vids)),str(len(matches)),str(len(self.groups)),f'{saving/1024**3:.2f} GB']
-        for lbl,v in zip(self.count_labels,stats):lbl.configure(text=v)
-        self.status.set(f'Done. {len(matches)} likely matches found. {len(errors)} unreadable files. Compare manually before deleting.')
+        self.count_labels[0].configure(text=str(len(vids)))
+        self.status.set(f'Done. {len(matches)} matched pairs found. {len(errors)} unreadable files. Compare each pair, then tick the video to delete.')
         self.progress['value']=100
         if self.tree.get_children():self.tree.see(self.tree.get_children()[0])
         if errors:
             with open(BASE/'scan-errors.txt','w',encoding='utf-8') as f:
                 for p,e in errors:f.write(f'{p}: {e}\n')
 
+    def _quality(self,path):
+        v=self.vids.get(path)
+        return (v.width*v.height,v.size,path) if v else (0,0,path)
+
     def filter_results(self):
+        """One parent row per matched pair, always with exactly two videos underneath."""
         if not hasattr(self,'tree'):return
         self.tree.delete(*self.tree.get_children())
         self.preview_seq+=1
-        self.item_path={}; self.group_members={}
+        self.item_path={};self.pair_items={}
         try: floor=float(self.min_score.get())
         except (ValueError,tk.TclError): floor=0
-        visible=[m for m in self.matches if m.confidence>=floor]
-        indexed=groups(visible)
-        def size(p):return self.vids[p].size if p in self.vids else 0
+        visible=[m for m in self.matches if m.confidence>=floor and m.left in self.vids and m.right in self.vids]
+        def size(p):return self.vids[p].size
+        def saving(m):return min(size(m.left),size(m.right))
         sort=self.sort_by.get()
-        if sort=='Potential savings':indexed.sort(key=lambda g:sum(map(size,g))-max(map(size,g)),reverse=True)
-        elif sort=='Group name':indexed.sort(key=lambda g:os.path.basename(g[0]).lower())
-        elif sort=='Best similarity':indexed.sort(key=lambda g:max((m.confidence for m in visible if m.left in g and m.right in g),default=0),reverse=True)
-        else:indexed.sort(key=len,reverse=True)
-        for i,g in enumerate(indexed):
-            saving=sum(map(size,g))-max(map(size,g))
-            gid=f'g{i}';self.group_members[gid]=list(g)
-            self.tree.insert('','end',iid=gid,text=f'Group {i+1}  |  {len(g)} videos',values=('','',f'{saving/1024**2:.0f} MB'),open=i<40)
-            # Higher-quality file listed first. The first one is the suggested keeper.
-            ordered=sorted(g,key=lambda path:(self.vids[path].width*self.vids[path].height,size(path)),reverse=True)
-            for j,path in enumerate(ordered):
+        if sort=='Potential savings':visible.sort(key=saving,reverse=True)
+        elif sort=='Name':visible.sort(key=lambda m:os.path.basename(m.left).lower())
+        else:visible.sort(key=lambda m:m.confidence,reverse=True)
+        self.visible_pairs=visible
+        for i,m in enumerate(visible):
+            # Better-quality file first (more pixels, then bigger file).
+            a,b=sorted((m.left,m.right),key=self._quality,reverse=True)
+            pid=f'p{i}'
+            self.tree.insert('','end',iid=pid,text=f'Pair {i+1}  |  {m.confidence:.0f}% match',values=('','',f'{saving(m)/1024**2:.0f} MB'),open=True,tags=('pair',))
+            self.pair_items[pid]=(m,[a,b])
+            for j,path in enumerate((a,b)):
                 vid=self.vids[path];iid=f'v{i}_{j}';self.item_path[iid]=path
-                confid=max((m.confidence for m in visible if m.left==path or m.right==path),default=0)
-                self.tree.insert(gid,'end',iid=iid,text=('KEEP  ' if j==0 else 'COPY  ')+os.path.basename(path),
-                    values=(f'{confid:.0f}%',f'{vid.width}×{vid.height}',f'{size(path)/1024**2:.1f} MB'))
-        self.status.set(f'Showing {len(indexed)} groups above {floor:.0f}% match score. Select copies to recycle, keeping originals.')
+                self.tree.insert(pid,'end',iid=iid,text=('★ ' if j==0 else '   ')+os.path.basename(path),
+                    values=('☐',f'{vid.width}×{vid.height}',f'{size(path)/1024**2:.1f} MB'))
+        self.refresh_marks()
+        self.status.set(f'Showing {len(visible)} pairs at {floor:.0f}% match or higher. ★ = suggested keeper. Tick "Delete" on the video to remove.')
 
-    def select_copies(self):
-        chosen=[]
-        for gid,g in self.group_members.items():
-            children=self.tree.get_children(gid)
-            # First row is recommended keeper (resolution and file size based).
-            chosen.extend(children[1:])
-        self.tree.selection_set(chosen)
-        self.status.set(f'{len(chosen)} candidate copies selected. Review carefully before recycling.')
+    def refresh_marks(self):
+        """Sync every checkbox (list rows, preview boxes, counters) with self.marked."""
+        self.marked={p for p in self.marked if os.path.exists(p)}
+        for iid,path in self.item_path.items():
+            on=path in self.marked
+            self.tree.set(iid,'delete','☑' if on else '☐')
+            self.tree.item(iid,tags=('marked',) if on else ())
+        total=sum(self.vids[p].size for p in self.marked if p in self.vids)
+        if hasattr(self,'count_labels'):
+            self.count_labels[1].configure(text=str(len(getattr(self,'visible_pairs',[]))))
+            self.count_labels[2].configure(text=str(len(self.marked)))
+            self.count_labels[3].configure(text=f'{total/1024**3:.2f} GB')
+        if hasattr(self,'recycle_btn'):self.recycle_btn.configure(text=f'Recycle marked ({len(self.marked)})')
+        for slot,var in enumerate(self.slot_vars):
+            path=self.preview_paths[slot] if slot<len(self.preview_paths) else None
+            var.set(bool(path and path in self.marked))
+
+    def toggle_path(self,path):
+        if not path:return
+        if path in self.marked:self.marked.discard(path)
+        else:self.marked.add(path)
+        self.refresh_marks()
+
+    def _toggle_slot(self,slot):
+        path=self.preview_paths[slot] if slot<len(self.preview_paths) else None
+        if path:self.toggle_path(path)
+        else:self.slot_vars[slot].set(False)
+
+    def _tree_click(self,event):
+        iid=self.tree.identify_row(event.y)
+        if iid in self.item_path and self.tree.identify_column(event.x)=='#1' and self.tree.identify_region(event.x,event.y)=='cell':
+            self.toggle_path(self.item_path[iid])
+
+    def _tree_space(self,_event=None):
+        iid=self.tree.focus()
+        if iid in self.item_path:self.toggle_path(self.item_path[iid]);return 'break'
+
+    def mark_worse(self):
+        """Mark the lower-quality video of every visible pair. The best file of any set of related videos is never marked."""
+        for m in getattr(self,'visible_pairs',[]):
+            a,b=sorted((m.left,m.right),key=self._quality,reverse=True)
+            self.marked.add(b)
+        self.refresh_marks()
+        self.status.set(f'{len(self.marked)} lower-quality videos marked. Review each pair before recycling.')
+
+    def clear_marks(self):
+        self.marked.clear();self.refresh_marks();self.status.set('All marks cleared.')
 
     def recycle_selected(self):
-        paths={self.item_path[i] for i in self.tree.selection() if i in self.item_path}
+        paths={p for p in self.marked if os.path.isfile(p)}
         if not paths:
-            messagebox.showinfo('No files selected','Select individual COPY rows or click Select all copies.');return
-        # Do not permit removing all files from a connected duplicate group.
-        for group in self.groups:
+            messagebox.showinfo('Nothing marked','Tick "Delete" on a video in a pair first (or use Auto-mark lower quality).');return
+        # Never allow removing every video of a set of related videos.
+        for group in groups(self.matches):
             existing={p for p in group if os.path.isfile(p)}
             if existing and existing <= paths:
-                messagebox.showerror('Keep one copy','You selected every file in a group. Deselect at least one file per group.');return
-        total=sum(os.path.getsize(p) for p in paths if os.path.exists(p))
-        if not messagebox.askyesno('Move to Recycle Bin',f'Move {len(paths)} selected videos ({total/1024**3:.2f} GB) to the Recycle Bin?\n\nMatching is approximate. Review your selections first.\n\nThis will NOT permanently delete files.',icon='warning'):return
+                names='\n'.join(os.path.basename(p) for p in sorted(existing)[:6])
+                messagebox.showerror('Keep one copy',f'You marked every video of a related set:\n{names}\n\nUntick at least one so a copy is kept.');return
+        total=sum(os.path.getsize(p) for p in paths)
+        both=sum(1 for m in self.matches if m.left in paths and m.right in paths)
+        extra=f'\n\nNote: {both} pair(s) have BOTH videos marked (another copy of them is kept).' if both else ''
+        if not messagebox.askyesno('Move to Recycle Bin',f'Move {len(paths)} marked videos ({total/1024**3:.2f} GB) to the Recycle Bin?\n\nMatching is approximate. Review your selections first.\n\nThis will NOT permanently delete files.{extra}',icon='warning'):return
         try:from send2trash import send2trash
         except ImportError:
             messagebox.showerror('Missing dependency','Install send2trash and rebuild the application.');return
@@ -220,6 +266,7 @@ class App(tk.Tk):
             try:send2trash(path);moved.append(path)
             except Exception as exc:errors.append(f'{path}: {exc}')
         deleted=set(moved)
+        self.marked-=deleted
         self.matches=[m for m in self.matches if m.left not in deleted and m.right not in deleted]
         self.groups=groups(self.matches)
         self.filter_results()
@@ -332,37 +379,21 @@ class App(tk.Tk):
             name.configure(text=os.path.basename(path))
             info.configure(text=f'{v.width} × {v.height} | {v.duration:.1f}s | {v.size/1024**2:.1f} MB\n{path}')
             self._load_preview(path,slot,token)
+        self.refresh_marks()
         if match:
             self.score.configure(text=f'Match: {match.confidence:.1f}%  |  {match.aligned_frames} aligned frames  |  overlap {match.covered:.0%}\n{match.evidence}')
         else:
-            self.score.configure(text='Select a video or group to review possible duplicates.')
+            self.score.configure(text='Select a pair to compare the two videos.')
 
     def selected(self,_event=None):
         selection=list(self.tree.selection())
         if not selection:return
-        file_rows=[i for i in selection if i in self.item_path]
-        if file_rows:
-            path=self.item_path[file_rows[-1]]
-            self.active_path=path
-            selected_paths=[self.item_path[i] for i in file_rows]
-            match=next((m for m in sorted(self.matches,key=lambda m:m.confidence,reverse=True)
-                        if (m.left == path and m.right in self.vids) or
-                           (m.right == path and m.left in self.vids)),None)
-            if len(selected_paths)>=2:
-                other=next((p for p in reversed(selected_paths[:-1]) if p!=path),None)
-                pair=[path,other] if other else [path]
-            elif match:
-                pair=[path,match.right if match.left==path else match.left]
-            else:pair=[path]
-            self._display_pair(pair,match)
-        else:
-            group_id=next((i for i in selection if i in self.group_members),None)
-            if group_id:
-                group=self.group_members[group_id]
-                pair=group[:2]
-                self.active_path=pair[0] if pair else None
-                match=next((m for m in self.matches if m.left in pair and m.right in pair),None)
-                self._display_pair(pair,match)
+        iid=selection[0]
+        pid=iid if iid in self.pair_items else self.tree.parent(iid)
+        if pid not in self.pair_items:return
+        match,paths=self.pair_items[pid]
+        self.active_path=self.item_path.get(iid,paths[0])
+        self._display_pair(paths,match)
 
     def open_selected(self):
         if not hasattr(self,'active_path'):return

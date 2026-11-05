@@ -1,4 +1,17 @@
-# Vidupe Next v7.1: faster scanning + matching engine rewrite + preview fix
+# Vidupe Next v7.2: pair review + faster scanning + matching engine rewrite + preview fix
+
+## v7.2: compare video to video, choose what to delete (new)
+* Results are now **one row per matched pair, always exactly two videos**. A chain such as A~B, B~C, A~C is shown as
+  three separate pairs instead of one 3-file group.
+* Click a pair to compare its two videos side by side. Every video has a **Delete** tick box, both in the list
+  (click the box, or press Space) and under its preview ("Delete this video"). They stay in sync, and a video that
+  appears in several pairs is ticked everywhere.
+* ★ marks the suggested keeper (more pixels, then bigger file).
+* Buttons: **Auto-mark lower quality**, **Clear marks**, **Recycle marked (N)**. Counters show pairs, marked videos and space to free.
+* Safety kept: files go to the Recycle Bin; you cannot mark every video of a set of related videos (at least one copy is
+  always kept); the confirmation dialog warns when both videos of a pair are marked.
+* Settings bar split into two rows so nothing is cut off.
+
 
 ## v7.1: scan speed (new)
 Profiling showed matching itself is cheap (~0.08 ms per pair); the time goes into **fingerprinting**, because every
