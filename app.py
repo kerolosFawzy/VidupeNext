@@ -23,7 +23,7 @@ class App(tk.Tk):
         self.folders=[];self.vids={};self.matches=[];self.groups=[];self.events=queue.Queue();self.stop=threading.Event();self.thumbnails=[]
         self.preview_pool=ThreadPoolExecutor(max_workers=2,thread_name_prefix='preview')
         self.preview_cache={};self.preview_seq=0;self.active_path=None;self.preview_paths=[None,None];self._preview_resize_job=None
-        self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Group size');self.interval=tk.StringVar(value='6');self.depth=tk.StringVar(value='Standard (48)');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
+        self.workers=tk.IntVar(value=max(2,min(6,(os.cpu_count() or 4)//2)));self.min_score=tk.DoubleVar(value=65);self.sort_by=tk.StringVar(value='Group size');self.interval=tk.StringVar(value='6');self.depth=tk.StringVar(value='Standard (48)');self.mode=tk.StringVar(value='Fast');self.sensitivity=tk.StringVar(value='Balanced');self.status=tk.StringVar(value='Add folders to scan. Original files are never modified during scanning.')
         self.build();self.after(100,self.poll)
 
     def label(self,parent,text,size=10,color=TEXT,bold=False):
@@ -48,6 +48,8 @@ class App(tk.Tk):
         ttk.Combobox(settings,textvariable=self.sensitivity,values=['Strict','Balanced','Sensitive'],state='readonly',width=15).pack(side='left',padx=(10,24))
         self.label(settings,'Sample every (seconds)',10,MUTED).pack(side='left')
         ttk.Combobox(settings,textvariable=self.interval,values=['3','6','10'],state='readonly',width=7).pack(side='left',padx=10)
+        self.label(settings,'Scan mode',10,MUTED).pack(side='left',padx=(15,4))
+        ttk.Combobox(settings,textvariable=self.mode,values=['Fast','Thorough'],state='readonly',width=9).pack(side='left',padx=4)
         self.label(settings,'Scan depth',10,MUTED).pack(side='left',padx=(15,4))
         ttk.Combobox(settings,textvariable=self.depth,values=['Quick (24)','Standard (48)','Deep (120)'],state='readonly',width=13).pack(side='left',padx=4)
         self.label(settings,'Parallel workers',10,MUTED).pack(side='left',padx=(15,4))
@@ -119,12 +121,12 @@ class App(tk.Tk):
         self.tree.delete(*self.tree.get_children());self.vids={};self.matches=[];self.groups=[]
         for lbl in self.count_labels:lbl.configure(text='0')
         self.status.set('Discovering videos...')
-        threshold,cover,_overlap=PROFILES[self.sensitivity.get()]; max_samples=int(self.depth.get().split('(')[1].rstrip(')'))
+        threshold,cover,_overlap=PROFILES[self.sensitivity.get()]; max_samples=int(self.depth.get().split('(')[1].rstrip(')'));thorough=self.mode.get()=='Thorough'
         workers=int(self.workers.get());interval=float(self.interval.get())
         def worker():
             try:
                 v,m,errors=scan(self.folders,str(BASE/'fingerprints.json'),interval,threshold,cover,
-                    lambda stage,n,total:self.events.put(('progress',stage,n,total)),self.stop,workers,max_samples)
+                    lambda stage,n,total:self.events.put(('progress',stage,n,total)),self.stop,workers,max_samples,thorough)
                 self.events.put(('done',v,m,errors))
             except Exception as e:self.events.put(('error',str(e)))
         threading.Thread(target=worker,daemon=True).start()
@@ -134,7 +136,7 @@ class App(tk.Tk):
             while True:
                 msg=self.events.get_nowait()
                 if msg[0]=='progress':
-                    _,stage,n,total=msg;self.status.set(f'{stage}: {n} / {total}')
+                    _,stage,n,total=msg;self.status.set(f'{ {"fingerprints":"Quick scan","refining":"Analysing likely matches","comparison":"Comparing"}.get(stage,stage) }: {n} / {total}')
                     if stage == 'fingerprints': self.count_labels[0].configure(text=str(n))
                     self.progress['value']=100*n/max(1,total)
                 elif msg[0]=='done':self.render(*msg[1:]);self.startbtn.configure(text='SCAN VIDEOS',bg=GREEN)

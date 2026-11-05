@@ -1,4 +1,17 @@
-# Vidupe Next v7: matching engine rewrite + preview fix
+# Vidupe Next v7.1: faster scanning + matching engine rewrite + preview fix
+
+## v7.1: scan speed (new)
+Profiling showed matching itself is cheap (~0.08 ms per pair); the time goes into **fingerprinting**, because every
+exact seek decodes part of a GOP (about 9 s per 90 s of 1080p with a 250-frame GOP, on one core). ffmpeg flag tweaks
+(probesize, threads, loop-filter, hwaccel) did not help, so the scan now does less decoding:
+* **Fast mode (default):** quick pass on every video (~4-6 samples + keyframes, 1.7 s vs 8.9 s for the 1080p test file),
+  then the full pass only for videos that have a possible partner. Cached, so rescans are quick.
+* **Thorough mode:** full analysis of every video (v7 behaviour). Use it to find short clips cut from longer videos.
+* GUI scan of the 37-video test set: Fast 18 s, Thorough 27 s (those files are tiny, so process start-up dominates;
+  the gain is larger for HD and long videos). Fast mode found 8/9 true pairs on the slow-pan set (misses one clip,
+  Thorough finds it) and 7/7 on the fast-motion set, 0 false pairs.
+* Fixed a hang I introduced while adding the mode option (a Tk variable was read from the worker thread).
+
 
 ## Preview fix (app.py)
 The preview was invisible because the image `Label` was created with `height=13`. For a label that shows an

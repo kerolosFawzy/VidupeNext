@@ -22,12 +22,13 @@ import numpy as np
 import cv2
 
 EXTENSIONS = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.webm','.mpeg','.mpg','.flv','.3gp','.ts','.mts'}
-CACHE_VERSION = 9
-FP_TAG = 'timeline-v7'
+CACHE_VERSION = 10
+FP_TAG = 'timeline-v8'
 MAX_FRAMES = 48            # default cap on samples per video (long movies get a wider grid)
 MIN_SAMPLES = 30           # short videos are sampled at least this densely (helps find clips inside longer videos)
 ALL_PAIRS_LIMIT = 800      # compare every pair up to this many videos; use LSH candidate search above
 BATCH = 16                 # seeks per ffmpeg process
+QUICK_SAMPLES = 6          # samples per video in the quick pass (fast mode)
 MAX_KEYFRAMES = 300        # keyframes kept per video for partial-overlap (clip) matching
 DECODE_SIDE = 64           # ffmpeg returns 64x64 gray frames (aspect ratio is normalised)
 HASH_BITS = 256
@@ -96,13 +97,14 @@ def probe(path: str) -> tuple[float, int, int]:
     return (float(obj.get('format',{}).get('duration') or 0),int(stream.get('width') or 0),int(stream.get('height') or 0))
 
 
-def effective_step(duration: float, interval: float, max_samples: int = MAX_FRAMES) -> float:
+def effective_step(duration: float, interval: float, max_samples: int = MAX_FRAMES, min_samples: int = MIN_SAMPLES,
+                   sparse: bool = False) -> float:
     """Sampling step in seconds, restricted to 0.5 * 2^n. Because every step is a power-of-two multiple of
     0.5 s and samples sit at 0.25 + k*step, the grid of a short clip is a refinement of a long video's grid,
     which keeps samples of a trimmed clip close to samples of its source."""
-    raw = min(interval, max(.5, duration / MIN_SAMPLES))     # short videos: at least ~30 samples
+    raw = min(interval, max(.5, duration / min_samples))     # short videos: at least ~30 samples
     raw = max(raw, duration / max_samples)                    # long movies: cap the sample count
-    step = .5 * 2 ** round(math.log2(raw / .5))
+    step = .5 * 2 ** (math.ceil(math.log2(raw / .5)) if sparse else round(math.log2(raw / .5)))
     if duration / step > max_samples * 1.5: step *= 2
     return step
 
@@ -181,10 +183,14 @@ def phash256(gray: np.ndarray) -> bytes | None:
 
 
 def analyze(path: str, interval: float = 4.0, stop: threading.Event | None = None, frame_progress=None,
-            max_samples: int = MAX_FRAMES) -> Video:
-    duration, w, h = probe(path)
-    if duration <= 0 or not w or not h: raise ValueError('No valid video track/duration')
-    step = effective_step(duration, interval, max_samples)
+            max_samples: int = MAX_FRAMES, base: Video | None = None, min_samples: int = MIN_SAMPLES, sparse: bool = False) -> Video:
+    """Fingerprint one video. `base` (a quick-pass Video) lets the full pass reuse probe + keyframe results."""
+    if base is None:
+        duration, w, h = probe(path)
+        if duration <= 0 or not w or not h: raise ValueError('No valid video track/duration')
+    else:
+        duration, w, h = base.duration, base.width, base.height
+    step = effective_step(duration, interval, max_samples, min_samples, sparse)
     wanted = sample_times(duration, step)
     got_t, got_f = _decode_samples(path, wanted, stop, fast=True)
     if len(got_t) < max(3, len(wanted) // 2):                    # shortcut options unsupported/failed: retry plainly
@@ -197,16 +203,24 @@ def analyze(path: str, interval: float = 4.0, stop: threading.Event | None = Non
         hsh = phash256(f[r0:r1, c0:c1])
         if hsh is not None: times.append(t); hashes.append(hsh.hex())
     if len(times) < 3: raise ValueError('Too few distinctive frames (black or static video)')
-    ktimes, khashes = [], []
-    try:
-        kt, kf = _decode_keyframes(path, duration, stop)
-        for t, f in zip(kt, kf):
-            hsh = phash256(f[r0:r1, c0:c1])
-            if hsh is not None: ktimes.append(round(t, 3)); khashes.append(hsh.hex())
-    except InterruptedError: raise
-    except Exception: pass                                           # keyframe layer is optional
+    if base is not None and base.khashes:
+        ktimes, khashes = base.ktimes, base.khashes
+    else:
+        ktimes, khashes = [], []
+        try:
+            kt, kf = _decode_keyframes(path, duration, stop)
+            for t, f in zip(kt, kf):
+                hsh = phash256(f[r0:r1, c0:c1])
+                if hsh is not None: ktimes.append(round(t, 3)); khashes.append(hsh.hex())
+        except InterruptedError: raise
+        except Exception: pass                                       # keyframe layer is optional
     if frame_progress: frame_progress(1, 1)
-    return Video(path, duration, w, h, os.path.getsize(path), round(step, 4), times, ''.join(hashes), ktimes, ''.join(khashes))
+    return Video(path, duration, w, h, os.path.getsize(path) if base is None else base.size, round(step, 4), times, ''.join(hashes), ktimes, ''.join(khashes))
+
+
+def analyze_quick(path: str, stop: threading.Event | None = None) -> Video:
+    """Cheap fingerprint (~8 samples + keyframes) used to decide which videos deserve the full analysis."""
+    return analyze(path, 1e9, stop, None, QUICK_SAMPLES, None, QUICK_SAMPLES, True)
 
 
 # ----------------------------------------------------------------------------- files and cache
@@ -434,49 +448,92 @@ def groups(matches: list[Match]):
     return sorted((sorted(v) for v in out.values() if len(v) > 1), key=lambda x: -len(x))
 
 
-def scan(folders: list[str], cache_path: str, interval: float = 4.0, threshold: float = .22, minimum_coverage: float = .55,
-         progress: Callable | None = None, stop: threading.Event | None = None, workers: int = 4,
-         max_samples: int = MAX_FRAMES):
-    """threshold = max hash distance (fraction of 256 bits); minimum_coverage = min matching share of the overlap."""
-    files = list(iter_files(folders)); cache = read_cache(cache_path); vids = []; errors = []
-    if progress: progress('discovered', 0, len(files))
-    pending = []
-    for path in files:
-        if stop is not None and stop.is_set(): break
-        try:
-            key = fingerprint_key(path) + f'|{interval:.3f}|{max_samples}|{FP_TAG}'
-            if key in cache: vids.append(Video(**cache[key]))
-            else: pending.append((path, key))
-        except Exception as exc: errors.append((path, str(exc)))
-    completed = len(vids) + len(errors)
-    if progress: progress('fingerprints', completed, len(files))
-    workers = max(1, min(16, int(workers)))
-    def job(item):
-        path, key = item
-        if stop is not None and stop.is_set(): raise InterruptedError('Scan cancelled')
-        return key, analyze(path, interval, stop, None, max_samples)
+def _parallel(jobs, workers, stop, on_done):
+    """jobs: [(tag, fn)]. Runs fn in a thread pool; on_done(tag, result, error) is called as each finishes."""
+    from concurrent.futures import wait, FIRST_COMPLETED
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        iterator = iter(pending); futures = {}
-        for _ in range(min(workers * 2, len(pending))):
-            item = next(iterator, None)
-            if item: futures[pool.submit(job, item)] = item
-        while futures:
-            for future in as_completed(tuple(futures)):
-                path, key = futures.pop(future)
-                try:
-                    k, vid = future.result(); vids.append(vid); cache[k] = asdict(vid)
-                    if len(vids) % 20 == 0: save_cache(cache_path, cache)
+        it = iter(jobs); futs = {}
+        def submit():
+            item = next(it, None)
+            if item is not None and (stop is None or not stop.is_set()): futs[pool.submit(item[1])] = item[0]
+        for _ in range(min(workers * 2, len(jobs))): submit()
+        while futs:
+            done, _ = wait(list(futs), return_when=FIRST_COMPLETED)
+            for f in done:
+                tag = futs.pop(f)
+                try: on_done(tag, f.result(), None)
                 except InterruptedError: pass
-                except Exception as exc: errors.append((path, str(exc) or exc.__class__.__name__))
-                completed += 1
-                if progress: progress('fingerprints', completed, len(files))
-                if stop is None or not stop.is_set():
-                    item = next(iterator, None)
-                    if item: futures[pool.submit(job, item)] = item
-                break
-    save_cache(cache_path, cache)
-    if stop is not None and stop.is_set(): return vids, [], errors
+                except Exception as exc: on_done(tag, None, str(exc) or exc.__class__.__name__)
+                submit()
+
+
+def scan(folders: list[str], cache_path: str, interval: float = 4.0, threshold: float = .23, minimum_coverage: float = .50,
+         progress: Callable | None = None, stop: threading.Event | None = None, workers: int = 4,
+         max_samples: int = MAX_FRAMES, thorough: bool = False):
+    """threshold = max hash distance (fraction of 256 bits); minimum_coverage = min matching share of the overlap.
+    Fast mode (default): a quick pass (~8 samples + keyframes) fingerprints every video; only videos that look
+    like they have a partner get the full pass (max_samples samples). thorough=True fully analyses every video."""
+    files = list(iter_files(folders)); cache = read_cache(cache_path); errors = []
+    workers = max(1, min(16, int(workers)))
+    if progress: progress('discovered', 0, len(files))
+    stopped = lambda: stop is not None and stop.is_set()
+    qkey = lambda fk: fk + '|quick|' + FP_TAG
+    fkey = lambda fk: fk + f'|{interval:.3f}|{max_samples}|' + FP_TAG
+
+    def run_stage(paths, label, keyfn, make):
+        """Fingerprint `paths` (cache first, then in parallel). Returns {path: Video}."""
+        out, jobs, total = {}, [], len(paths); done = 0
+        keys = {}
+        for p in paths:
+            try: keys[p] = keyfn(fingerprint_key(p))
+            except Exception as exc: errors.append((p, str(exc))); done += 1; continue
+            if keys[p] in cache: out[p] = Video(**cache[keys[p]]); done += 1
+            else: jobs.append((p, (lambda p=p: make(p))))
+        if progress: progress(label, done, total)
+        counter = [done]
+        def on_done(p, vid, err):
+            if err is None: out[p] = vid; cache[keys[p]] = asdict(vid)
+            else: errors.append((p, err))
+            counter[0] += 1
+            if progress: progress(label, counter[0], total)
+            if len(out) % 25 == 0: save_cache(cache_path, cache)
+        _parallel(jobs, workers, stop, on_done)
+        save_cache(cache_path, cache)
+        return out
+
+    cb = (lambda n, total: progress('comparison', n, total)) if progress else None
+    if thorough:
+        vids = run_stage(files, 'fingerprints', fkey, lambda p: analyze(p, interval, stop, None, max_samples))
+        if stopped(): return list(vids.values()), [], errors
+        vlist = list(vids.values()); pairs = None
+        matches = find_matches(vlist, threshold, minimum_coverage, callback=cb)
+        return vlist, matches, errors
+
+    # ---- fast mode: quick pass -> gate -> full pass on candidates only -> verify
+    quick = run_stage(files, 'fingerprints', qkey, lambda p: analyze_quick(p, stop))
+    if stopped(): return list(quick.values()), [], errors
+    qlist = list(quick.values())
     if progress: progress('comparing', 0, 1)
-    matches = find_matches(vids, threshold, minimum_coverage,
-        callback=(lambda n, total: progress('comparison', n, total)) if progress else None)
-    return vids, matches, errors
+    qpreps = [_Prep(v) for v in qlist]
+    gate_thr, gate_ratio = max(threshold, .27), min(minimum_coverage, .35)
+    pairs = []
+    for k, (i, j) in enumerate(candidates(qpreps), 1):
+        a_, b_ = qpreps[i], qpreps[j]
+        if (compare(a_, b_, '', '', gate_thr, gate_ratio, .1) or compare_keyframes(a_, b_, '', '', threshold)):
+            pairs.append((i, j))
+        if k % 500 == 0 and progress: progress('comparing', k, k)
+    need = sorted({x for pr in pairs for x in pr})
+    pidx = {qlist[i].path: i for i in need}
+    full = run_stage([qlist[i].path for i in need], 'refining', fkey,
+                     lambda p: analyze(p, interval, stop, None, max_samples, qlist[pidx[p]]))
+    if stopped(): return qlist, [], errors
+    fpreps = {i: _Prep(full[qlist[i].path]) for i in need if qlist[i].path in full}
+    results = []
+    for k, (i, j) in enumerate(pairs, 1):
+        if i in fpreps and j in fpreps:
+            m = (compare(fpreps[i], fpreps[j], qlist[i].path, qlist[j].path, threshold, minimum_coverage, minimum_coverage * .55)
+                 or compare_keyframes(fpreps[i], fpreps[j], qlist[i].path, qlist[j].path, threshold))
+            if m: results.append(m)
+        if cb and (k % 25 == 0 or k == len(pairs)): cb(k, len(pairs))
+    vids = [full.get(v.path, v) for v in qlist]
+    return vids, sorted(results, key=lambda m: m.confidence, reverse=True), errors
